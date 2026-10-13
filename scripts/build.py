@@ -149,8 +149,9 @@ def parity_cases(scenarios):
 
 def readme_tables(scenarios):
     rows = ["| № | Промпт | Когда | Результат | Чего не делает | Символов |", "|---|---|---|---|---|---:|"]
-    rows += [f"| {s['num']} | [{s['name']}](prompts/{s['file']}) | {s['when']} | {s['result']} | {s['never']} "
-             f"| {len(assemble(s)):,} |".replace(",", "\u00a0") for s in scenarios]
+    for s in scenarios:
+        size = f"{len(assemble(s)):,}".replace(",", "\u00a0")
+        rows.append(f"| {s['num']} | [{s['name']}](prompts/{s['file']}) | {s['when']} | {s['result']} | {s['never']} | {size} |")
     params = ["| Промпт | Параметр | Варианты |", "|---|---|---|"]
     for s in scenarios:
         for param in s["params"]:
