@@ -16,5 +16,5 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: python3 scripts/check.py
-      - run: python3 scripts/build_site.py --out "$RUNNER_TEMP/site"
+      - run: python3 scripts/build.py --check --site "$RUNNER_TEMP/site" --parity-cases "$RUNNER_TEMP/cases.json"
+      - run: node scripts/parity.mjs "$RUNNER_TEMP/site/index.html" "$RUNNER_TEMP/cases.json"
