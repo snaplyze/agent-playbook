@@ -97,23 +97,77 @@ def scenarios_from_readme():
     return [scenarios[num] for num in sorted(scenarios)]
 
 
-def param_field(slug, index, param, note):
-    key, _, value = param.partition(": ")
-    field_id = f"{slug}-p{index}"
-    help_html = f'<span class="help" id="{field_id}-help">{inline(note)}</span>'
-    if value == "…":
-        return (f'<div class="field"><label for="{field_id}">{html.escape(key)}</label>'
-                f'<input id="{field_id}" type="text" autocomplete="off" spellcheck="false" '
-                f'data-param="{html.escape(key)}" aria-describedby="{field_id}-help">{help_html}</div>')
-    return (f'<div class="field check"><input id="{field_id}" type="checkbox" data-param="{html.escape(param)}" '
-            f'aria-describedby="{field_id}-help"><label for="{field_id}">{html.escape(param)}</label>{help_html}</div>')
+# Как показать параметр на странице. Ключ — имя параметра из таблицы README.
+# select: (подпись, значение, подсказка поля) — значение None означает «по умолчанию, строки нет»,
+# подсказка не None — вариант просит дописать значение вручную.
+# help — пояснение под элементом: варианты уже видны в нем, поэтому здесь только смысл.
+PARAM_UI = {
+    "CI": {"kind": "select", "help": "Решение владельца важнее обнаруженных раннеров. Код из недоверенных источников на self-hosted не попадает в любом случае.", "options": [
+        ("По обнаружению", None, None),
+        ("Только hosted", "только hosted", None),
+        ("Self-hosted для всех подходящих заданий", "self-hosted для всех подходящих заданий", None),
+        ("Свое правило…", "", "например: self-hosted Linux x64 для сборки, остальное — hosted"),
+    ]},
+    "Доступ": {"kind": "check", "help": "Широкий неинтерактивный доступ агента на уровне проекта. Это ваш выбор, а не безопасный стандарт."},
+    "Установить оркестрацию": {"kind": "text", "placeholder": "репозиторий или путь установщика",
+                               "help": "Откуда установить роли или расширение для подагентов и в какую область. Без источника агент только проверяет, что уже настроено.",
+                               "scope": ["проект", "пользователь"]},
+    "Объем": {"kind": "select", "help": "По умолчанию агент доводит все согласованные задачи плана.", "options": [
+        ("Весь план", None, None),
+        ("Аудит…", "аудит", "название или дата аудита"),
+        ("Список ID…", "", "например: A-03, A-07"),
+    ]},
+    "Разрешено": {"kind": "multi", "help": "Неотмеченные действия агент только подготовит и предложит вам.", "options": [
+        "создание репозитория", "создание основной ветки", "первичная загрузка", "смена видимости",
+        "смена доступов", "другие ветки и теги", "перенос wiki", "перенос задач", "перенос релизов", "деплой",
+    ]},
+}
+
+
+def param_field(slug, index, param, note, raw):
+    key = param.partition(": ")[0]
+    ui = PARAM_UI.get(key) or fail(f"README: для параметра «{key}» нет описания в PARAM_UI")
+    # Варианты на странице должны дословно встречаться в тексте сценария, иначе агент их не узнает.
+    words = [value for _, value, _ in ui.get("options", []) if value] if ui["kind"] == "select" else []
+    words += [f"`{value}`" for value in ui.get("options", [])] if ui["kind"] == "multi" else []
+    words += ui.get("scope", [])
+    for word in words:
+        if word not in raw:
+            fail(f"вариант «{word}» параметра «{key}» не встречается в тексте сценария")
+    fid = f"{slug}-p{index}"
+    esc = html.escape
+    help_html = f'<span class="help" id="{fid}-help">{inline(ui.get("help", note))}</span>'
+    if ui["kind"] == "check":
+        return (f'<div class="field check" data-kind="check" data-line="{esc(param)}">'
+                f'<input id="{fid}" type="checkbox" aria-describedby="{fid}-help">'
+                f'<label for="{fid}">{esc(param)}</label>{help_html}</div>')
+    if ui["kind"] == "multi":
+        choices = "".join(f'<label class="choice"><input type="checkbox" value="{esc(value)}"> {esc(value)}</label>'
+                          for value in ui["options"])
+        return (f'<div class="field wide" data-kind="multi" data-key="{esc(key)}" role="group" '
+                f'aria-labelledby="{fid}-label" aria-describedby="{fid}-help">'
+                f'<span class="label" id="{fid}-label">{esc(key)}</span><div class="choices">{choices}</div>{help_html}</div>')
+    if ui["kind"] == "select":
+        options = "".join(
+            f'<option value="{esc(value or "")}"' + (f' data-input="{esc(hint)}"' if hint is not None else "")
+            + f">{esc(label)}</option>" for label, value, hint in ui["options"])
+        return (f'<div class="field" data-kind="select" data-key="{esc(key)}">'
+                f'<label for="{fid}">{esc(key)}</label>'
+                f'<select id="{fid}" aria-describedby="{fid}-help">{options}</select>'
+                f'<input type="text" hidden autocomplete="off" spellcheck="false" aria-label="{esc(key)}: значение">'
+                f'{help_html}</div>')
+    scope = "".join(f"<option>{esc(value)}</option>" for value in ui["scope"])
+    return (f'<div class="field" data-kind="text" data-key="{esc(key)}">'
+            f'<label for="{fid}">{esc(key)}</label><div class="combo">'
+            f'<input id="{fid}" type="text" autocomplete="off" spellcheck="false" placeholder="{esc(ui["placeholder"])}" '
+            f'aria-describedby="{fid}-help"><select aria-label="Область установки">{scope}</select></div>{help_html}</div>')
 
 
 def scenario_section(item):
     raw = (ROOT / item["path"]).read_text(encoding="utf-8")
     slug = Path(item["path"]).stem.split("-", 1)[1]
     item["slug"] = slug
-    fields = "".join(param_field(slug, i, param, note) for i, (param, note) in enumerate(item["params"]))
+    fields = "".join(param_field(slug, i, param, note, raw) for i, (param, note) in enumerate(item["params"]))
     params = f'<fieldset class="params"><legend>Параметры</legend>{fields}</fieldset>' if fields else ""
     block_button = ('<button type="button" class="secondary" data-copy="block">Скопировать блок для AGENTS.md</button>'
                     if BEGIN in raw else "")
@@ -249,7 +303,17 @@ code { -webkit-box-decoration-break: clone; box-decoration-break: clone; font: 0
 .field { display: grid; gap: 6px; align-content: start; }
 .field label { font-weight: 500; }
 .field input[type="text"] { font: 400 16px/1.4 var(--mono); color: var(--ink); background: var(--sheet); border: 1px solid var(--rule); border-radius: 6px; padding: 10px 12px; min-height: 44px; width: 100%; }
-.field input[type="text"]:focus { border-color: var(--stamp); outline: 2px solid var(--stamp-wash); outline-offset: 0; }
+.field select { font: 400 16px/1.4 var(--sans); color: var(--ink); background: var(--sheet); border: 1px solid var(--rule); border-radius: 6px; padding: 10px 12px; min-height: 44px; width: 100%; max-width: 100%; }
+.field input[type="text"]:focus, .field select:focus { border-color: var(--stamp); outline: 2px solid var(--stamp-wash); outline-offset: 0; }
+.field input[type="text"][hidden] { display: none; }
+.field .label { font-weight: 500; }
+.field.wide { grid-column: 1 / -1; }
+.choices { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 130px), 1fr)); gap: 2px 12px; }
+.choice { display: flex; gap: 10px; align-items: center; min-height: 40px; line-height: 1.3; cursor: pointer; }
+.choice input { width: 18px; height: 18px; margin: 0; flex: none; accent-color: var(--stamp); }
+.combo { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.combo select { width: auto; }
+html:not(.js) .params { display: none; }
 .field.check { grid-template-columns: auto 1fr; column-gap: 10px; }
 .field.check input { width: 18px; height: 18px; margin: 3px 0 0; accent-color: var(--stamp); }
 .field.check .help { grid-column: 2; }
@@ -328,6 +392,9 @@ footer p { margin: 0; max-width: 46rem; }
   .rail li:last-child:nth-child(odd) { grid-column: 1 / -1; }
   .scenario h2 { font-size: 1.5rem; }
   .actions button { flex: 1 1 auto; }
+  .combo { grid-template-columns: minmax(0, 1fr); }
+  .combo select { width: 100%; }
+  .choice { font-size: 15px; }
   .actions button.quiet { flex: 0 0 auto; }
   .doc { font-size: 1rem; line-height: 1.6; }
   .doc h3 { font-size: 1.35rem; }
@@ -398,19 +465,47 @@ footer p { margin: 0; max-width: 46rem; }
   sections.forEach((section) => {
     const raw = section.querySelector("pre.raw").textContent;
     const fill = section.querySelector(".fill");
-    const inputs = [...section.querySelectorAll("[data-param]")];
+    const fields = [...section.querySelectorAll(".field[data-kind]")];
     const toggle = section.querySelector("[data-toggle]");
-    const lines = () => inputs.flatMap((input) => {
-      if (input.type === "checkbox") return input.checked ? [input.dataset.param] : [];
-      const value = input.value.trim().replace(/\\s+/g, " ");
-      return value ? [input.dataset.param + ": " + value] : [];
-    });
+    const clean = (value) => value.trim().replace(/\\s+/g, " ");
+    // Строка параметра в том виде, в каком ее ждет сценарий; null — параметр не задан.
+    function line(field) {
+      const key = field.dataset.key;
+      switch (field.dataset.kind) {
+        case "check":
+          return field.querySelector("input").checked ? field.dataset.line : null;
+        case "multi": {
+          const picked = [...field.querySelectorAll("input:checked")].map((input) => input.value);
+          return picked.length ? key + ": " + picked.join(", ") : null;
+        }
+        case "select": {
+          const option = field.querySelector("select").selectedOptions[0];
+          const text = field.querySelector("input[type=text]");
+          const needsText = "input" in option.dataset;
+          text.hidden = !needsText;
+          if (needsText) text.placeholder = option.dataset.input;
+          const extra = needsText ? clean(text.value) : "";
+          if (needsText ? !extra : !option.value) return null;
+          return key + ": " + [option.value, extra].filter(Boolean).join(" ");
+        }
+        default: {
+          const value = clean(field.querySelector("input").value);
+          return value ? key + ": " + value + ", область: " + field.querySelector("select").value : null;
+        }
+      }
+    }
+    const lines = () => fields.map(line).filter(Boolean);
     const update = () => {
       const filled = lines();
       fill.textContent = filled.join("\\n");
       fill.hidden = filled.length === 0;
     };
-    inputs.forEach((input) => input.addEventListener("input", update));
+    section.addEventListener("input", update);
+    section.addEventListener("change", (event) => {
+      update();
+      const text = event.target.matches("select") && event.target.parentElement.querySelector("input[type=text]:not([hidden])");
+      if (text && event.target.closest('[data-kind="select"]')) text.focus();
+    });
     update();
 
     function setRaw(on) {
