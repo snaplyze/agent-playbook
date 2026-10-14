@@ -2,17 +2,31 @@
 """Сборка самодостаточных промптов, таблиц README и страницы GitHub Pages из src/.
 
   python3 scripts/build.py                собрать prompts/ и таблицы README
-  python3 scripts/build.py --check        проверить, что все собрано из src/, и прогнать проверки
+  python3 scripts/build.py --check        проверить, что все собрано из src/, и прогнать проверки; ничего не пишет
   python3 scripts/build.py --site _site   дополнительно собрать страницу в каталог _site
+
+Полная проверка, как в CI (<tmp> — каталог вне репозитория): --check --site <tmp>/site --parity-cases <tmp>/cases.json,
+затем node scripts/parity.mjs <tmp>/site/index.html <tmp>/cases.json.
 """
+import sys
+
+# Вывод всегда в UTF-8, непредставимое — экранируется: в локали C кириллица иначе роняет print (UnicodeEncodeError).
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+if sys.version_info < (3, 11):  # до импорта: tomllib появился в 3.11
+    sys.exit(f"build: нужен Python 3.11 или новее (модуль tomllib), запущен {sys.version.split()[0]}")
+
 import argparse
 import html
+import itertools
 import json
+import math
 import os
 import re
-import sys
 import tomllib
 from pathlib import Path
+from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
@@ -23,14 +37,42 @@ PARAMS, RULES = "{{ПАРАМЕТРЫ}}", "{{ПРАВИЛА}}"
 PROMPT_LIMIT = 20000  # символов: промпт отправляется одним сообщением
 # Пустое обязательное значение: агент должен спросить, а не взять пример из подсказки поля.
 MISSING = "<не указано: спроси владельца, не угадывай>"
+# Пробельные символы ввода: Юникодный White_Space, разделители C0 (\x1c-\x1f) и U+FEFF (его считает пробелом JS).
+# Тело класса символов, одно и то же для re и для RegExp страницы: build_site подставляет его в скрипт
+# страницы на место @WHITESPACE@, поэтому clean здесь и clean там не расходятся.
+WHITESPACE = r"\t\n\v\f\r \x1c-\x1f\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+SPACES = re.compile(f"[{WHITESPACE}]+")
 
-# Промпты описывают возможности по сути: без названий клиентов, расширений и версий.
-FORBIDDEN = [
-    r"\b(codex|claude|cursor|gemini|copilot|windsurf|aider|cline|roo|jules|zed|openai|anthropic|gpt)\b",
-    r"\borchestration:", r"\$[a-z][\w-]+", r"create_goal", r"(?<![\w/-])/goal\b",
+# Промпты описывают возможности по сути: без названий клиентов, расширений, моделей и версий.
+# Проверяется только src/: промпты и страница собраны из него. Список неполон по природе — это страховка, а не
+# замена внимания. Решения по спорным случаям:
+#  - кириллицей запрещены только формы, не совпадающие с обычными словами («Клод», «Копилот», «ЧатГПТ»);
+#    «курсор», «кодекс», «сонет», «опус», «лама» — обычные слова, их названия клиентов и моделей латиницей ловятся;
+#  - «Zed» запрещен только с заглавной буквы (редактор); «zed» строчными — не отдельное слово русского текста,
+#    но и не имя клиента в тексте промпта, поэтому не запрещен;
+#  - «$goal», «$skill-name» (строчные, как вызов навыка) запрещены, переменные окружения («$HOME», «$RUNNER_TEMP»)
+#    и числа с «$» — нет; строчные переменные оболочки в тексте называй заглавными или пиши <tmp>;
+#  - номер версии «1.2.3» запрещен, а четыре числа через точку («10.0.0.1») — нет: так записан IPv4-адрес
+#    (версия из четырех частей тоже пройдет); дата с годом из четырех цифр («14.10.2026») не совпадает.
+FORBIDDEN = [re.compile(pattern, re.I) for pattern in (
+    r"\b(?:codex|claude|cursor|gemini|copilot|windsurf|aider|cline|roo|jules|openai|anthropic|chatgpt|deepseek"
+    r"|mistral|qwen|grok|llama|sonnet|opus|haiku|jetbrains|intellij|vscode|plugins?)\b",
+    r"\bgpt", r"(?-i:\bZed\b)", r"\bvs[\s-]?code\b", r"\bvisual studio\b",
+    r"\b(?:клод|копайлот|копилот|джемини|виндсерф|антропик|опен\s?эй\s?ай|чат[\s-]?gpt"
+    r"|чат[\s-]?джи[\s-]?пи[\s-]?ти|джи[\s-]?пи[\s-]?ти)\w*",
+    r"\borchestration:", r"(?-i:\$[a-z][a-z0-9-]*\b)", r"create_goal", r"(?<![\w/-])/goal\b",
     r"policy-version", r"unified-agent-policy", r"\bv\d+\b",
-    r"\b\d+\.\d+\.\d{1,3}\b",  # номер версии; даты с годом из 4 цифр не совпадают
+    r"(?<![\d.])\d+\.\d+\.\d{1,3}\b(?!\.\d)",  # номер версии
     r"редакци\w*\s+\d", r"плагин",
+)]
+# Проверка самого списка: (текст, должен ли он быть запрещен).
+FORBIDDEN_SAMPLES = [
+    ("Клод", True), ("у Клода", True), ("ChatGPT", True), ("GPT-4o", True), ("чат-джи-пи-ти", True),
+    ("Sonnet", True), ("Opus", True), ("Llama", True), ("VS Code", True), ("plugin", True), ("плагин", True),
+    ("Cursor", True), ("CLAUDE.md", True), ("Zed", True), ("`$goal`", True), ("версия 3.11.4", True), ("v2", True),
+    ("$HOME/x", False), ("$RUNNER_TEMP", False), ("10.0.0.1", False), ("192.168.1.10.", False),
+    ("14.10.2026", False), ("курсор", False), ("кодекс", False), ("zed", False), ("organized", False),
+    ("Python 3.11+", False),
 ]
 
 
@@ -38,50 +80,163 @@ def fail(message):
     sys.exit(f"build: {message}")
 
 
+def read(path):
+    """Текст файла в UTF-8; ошибка чтения — сообщение, а не трассировка."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        fail(f"{path.relative_to(ROOT)}: файл не в UTF-8")
+    except OSError as error:
+        fail(f"{path.relative_to(ROOT)}: {error.strerror or error}")
+
+
 # --- Модель: сценарии, параметры, сборка текста -------------------------------------------------
 
+# Схема scenarios.toml. Белый список ключей: новое поле добавляй сюда вместе с кодом, который его читает.
+SCENARIO_KEYS = {"file", "name", "when", "result", "never", "param"}
+OPTION_PARAM_KEYS = {"key", "help", "option"}
+CHOICES_PARAM_KEYS = {"key", "help", "choices", "default", "all", "none", "some"}
+OPTION_KEYS = {"label", "line", "input", "choice"}
+FILE_NAME = re.compile(r"(\d{2})-([a-z0-9]+(?:-[a-z0-9]+)*)\.md")
+
+
+def check_keys(table, allowed, where):
+    extra = sorted(set(table) - allowed)
+    if extra:
+        fail(f"{where}: неизвестные ключи {', '.join(f'«{key}»' for key in extra)}; "
+             f"допустимы {', '.join(f'«{key}»' for key in sorted(allowed))}")
+
+
+def string_field(table, key, where):
+    if key not in table:
+        fail(f"{where}: нет поля «{key}»")
+    if not isinstance(table[key], str) or not table[key].strip():
+        fail(f"{where}: поле «{key}» должно быть непустой строкой")
+    return table[key]
+
+
+def string_list(table, key, where):
+    values = table.get(key)
+    if key not in table:
+        fail(f"{where}: нет поля «{key}»")
+    if not isinstance(values, list) or not values or not all(isinstance(v, str) and v.strip() for v in values):
+        fail(f"{where}: поле «{key}» должно быть непустым списком непустых строк")
+    repeated = sorted({v for v in values if values.count(v) > 1})
+    if repeated:
+        fail(f"{where}: в поле «{key}» повторяются {', '.join(f'«{v}»' for v in repeated)}")
+    return values
+
+
+def table_list(parent, key, where):
+    items = parent.get(key, [])
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        fail(f"{where}: «{key}» должно быть массивом таблиц [[...]]")
+    return items
+
+
+def validate_param(where, param):
+    kinds = [kind for kind in ("option", "choices") if kind in param]
+    if len(kinds) != 1:
+        fail(f"{where}: нужно ровно одно из «option» (выбор одного) и «choices» (выбор нескольких)")
+    check_keys(param, CHOICES_PARAM_KEYS if kinds[0] == "choices" else OPTION_PARAM_KEYS, where)
+    string_field(param, "help", where)
+    if kinds[0] == "choices":
+        string_list(param, "choices", where)
+        if param.get("default") not in ("all", "none"):
+            fail(f"{where}: поле «default» должно быть «all» или «none»")
+        for key in ("all", "none", "some"):
+            string_field(param, key, where)
+        return
+    options = table_list(param, "option", where)
+    if not options:
+        fail(f"{where}: нет вариантов")
+    for number, option in enumerate(options, 1):
+        label = option.get("label")
+        place = f"{where}, вариант «{label}»" if isinstance(label, str) else f"{where}, вариант №{number}"
+        check_keys(option, OPTION_KEYS, place)
+        string_field(option, "label", place)
+        line = string_field(option, "line", place)
+        if "input" in option:
+            string_field(option, "input", place)
+            if number == 1:
+                fail(f"{place}: первый вариант — значение по умолчанию, он не может требовать ввода")
+        if "choice" in option:
+            string_list(option, "choice", place)
+        if ("{input}" in line) != ("input" in option):
+            fail(f"{place}: {{input}} и поле input должны быть вместе")
+        if ("{choice}" in line) != ("choice" in option):
+            fail(f"{place}: {{choice}} и поле choice должны быть вместе")
+
+
 def load():
-    data = tomllib.loads((SRC / "scenarios.toml").read_text(encoding="utf-8"))
-    rules = (SRC / "rules.md").read_text(encoding="utf-8").strip()
-    listed = {item["file"] for item in data["scenario"]}
+    """Читает src/, проверяет схему и возвращает (сценарии, текст общих правил)."""
+    try:
+        data = tomllib.loads(read(SRC / "scenarios.toml"))
+    except tomllib.TOMLDecodeError as error:
+        fail(f"scenarios.toml: {error}")
+    check_keys(data, {"scenario"}, "scenarios.toml")
+    items = table_list(data, "scenario", "scenarios.toml")
+    if not items:
+        fail("scenarios.toml: нет ни одного [[scenario]]")
+    rules = read(SRC / "rules.md")
+    scenarios, owners = [], {}
+    for number, item in enumerate(items, 1):
+        file = item.get("file")
+        where = f"scenarios.toml, сценарий {file}" if isinstance(file, str) else f"scenarios.toml, сценарий №{number}"
+        check_keys(item, SCENARIO_KEYS, where)
+        for key in ("file", "name", "when", "result", "never"):
+            string_field(item, key, where)
+        match = FILE_NAME.fullmatch(file)
+        if not match:
+            fail(f"{where}: имя файла должно быть вида NN-имя.md: две цифры, дефис, имя из латинских строчных букв, "
+                 f"цифр и дефисов")
+        num, sid = match.groups()
+        for kind, value in (("file", file), ("num", num), ("id", sid)):
+            if (kind, value) in owners:
+                fail(f"{where}: {kind} «{value}» уже занят сценарием {owners[kind, value]}")
+            owners[kind, value] = file
+        params = table_list(item, "param", where)
+        keys = []
+        for position, param in enumerate(params, 1):
+            key = param.get("key")
+            place = f"{where}, параметр «{key}»" if isinstance(key, str) else f"{where}, параметр №{position}"
+            string_field(param, "key", place)
+            if key in keys:
+                fail(f"{place}: имя параметра повторяется")
+            keys.append(key)
+            validate_param(place, param)
+        scenarios.append(dict(item, id=sid, num=num, params=params))
+    reserved = set(re.findall(r"""(?<![\w-])id=["']([^"'@{]+)""", TEMPLATE))  # id служебных элементов страницы
+    for s in scenarios:
+        # Страница строит id вида «<id>», «<id>-title», «<id>-0-label»…: id сценария не должен совпасть с чужим
+        # id (служебным или другого сценария) и не должен быть его началом или продолжением через дефис.
+        others = reserved | {o["id"] for o in scenarios if o is not s}
+        clash = [o for o in sorted(others) if s["id"] == o or s["id"].startswith(o + "-") or o.startswith(s["id"] + "-")]
+        if clash:
+            fail(f"scenarios.toml, сценарий {s['file']}: id «{s['id']}» пересекается с id «{clash[0]}» на странице; "
+                 f"переименуй файл")
+    listed = {s["file"] for s in scenarios}
     present = {path.name for path in (SRC / "scenarios").glob("*.md")}
     if listed != present:
         fail(f"src/scenarios/ и scenarios.toml расходятся: {sorted(listed ^ present)}")
-    scenarios = []
-    for item in data["scenario"]:
-        source = (SRC / "scenarios" / item["file"]).read_text(encoding="utf-8")
+    for scenario in scenarios:
+        source = read(SRC / "scenarios" / scenario["file"])
         for token in (PARAMS, RULES):
             if source.count(token) != 1:
-                fail(f"src/scenarios/{item['file']}: {token} должен встречаться ровно один раз")
-        params = item.get("param", [])
-        for param in params:
-            validate(item["file"], param)
-        if len({param["key"] for param in params}) != len(params):
-            fail(f"{item['file']}: повторяются имена параметров")
-        scenarios.append(dict(item, id=Path(item["file"]).stem.split("-", 1)[1],
-                              num=item["file"][:2], text=source.replace(RULES, rules), params=params))
-    return scenarios
-
-
-def validate(file, param):
-    where = f"{file}, параметр «{param['key']}»"
-    if "choices" in param:
-        if param.get("default") not in ("all", "none") or not all(param.get(k) for k in ("all", "none", "some")):
-            fail(f"{where}: нужны default = all|none и тексты all, none, some")
-        return
-    if "input" in param.get("option", [{}])[0]:
-        fail(f"{where}: первый вариант — значение по умолчанию, он не может требовать ввода")
-    for option in param.get("option") or fail(f"{where}: нет вариантов"):
-        if ("{input}" in option["line"]) != ("input" in option):
-            fail(f"{where}, «{option['label']}»: {{input}} и поле input должны быть вместе")
-        if ("{choice}" in option["line"]) != ("choice" in option):
-            fail(f"{where}, «{option['label']}»: {{choice}} и поле choice должны быть вместе")
+                fail(f"src/scenarios/{scenario['file']}: {token} должен встречаться ровно один раз")
+        scenario.update(source=source, text=source.replace(RULES, rules.strip()))
+    return scenarios, rules
 
 
 def default_state(param):
     if "choices" in param:
         return {"picked": list(param["choices"]) if param["default"] == "all" else []}
     return {"index": 0}
+
+
+def clean(value):
+    """Ввод пользователя: подряд идущие пробельные символы — один пробел, по краям пробелов нет."""
+    return SPACES.sub(" ", value).strip(" ")
 
 
 def param_text(param, state):
@@ -95,7 +250,7 @@ def param_text(param, state):
     option = param["option"][state["index"]]
     text = option["line"]
     if "input" in option:
-        text = text.replace("{input}", " ".join(state.get("input", "").split()) or MISSING)
+        text = text.replace("{input}", clean(state.get("input", "")) or MISSING)
     if "choice" in option:
         text = text.replace("{choice}", state.get("choice") or option["choice"][0])
     return text
@@ -121,36 +276,131 @@ def assemble(scenario, states=None):
     return before + params_block(scenario, states) + after
 
 
+# --- Случаи для проверок: сверка страницы с Python и предел длины ------------------------------
+
+FULL_LIMIT = 100  # полный перебор сочетаний вариантов параметров, пока их не больше
+# Пробельные символы во вводе: NBSP, табуляция, перевод строки, U+FEFF, U+0085, U+001C.
+SPACE_PROBES = ("\u00a0", "\t", "\n", "\ufeff", "\x85", "\x1c")
+
+
+def filled_input(index):
+    """Ввод со своим номером параметра: общее состояние ввода у двух параметров дало бы чужое значение."""
+    return f"  значение {index}   $& из поля "
+
+
+def param_variants(param, index, thorough):
+    """Состояния одного параметра: каждый вариант, у варианта с вводом — заполненный и пустой ввод (при thorough
+    еще ввод с каждым пробельным символом по краям и внутри и ввод из одних пробельных символов), у варианта
+    с выбором — каждое значение; для множественного выбора — пустой, полный и два частичных набора."""
+    if "choices" in param:
+        picked = ([], param["choices"], param["choices"][:1], param["choices"][1:])
+        return [{"picked": list(p)} for p in picked]
+    variants = []
+    for position, option in enumerate(param["option"]):
+        inputs = [""]
+        if "input" in option:
+            inputs = [filled_input(index), ""]
+            if thorough:
+                inputs += [f"{c}ввод{c}{c}значение{c}" for c in SPACE_PROBES] + ["".join(SPACE_PROBES)]
+        for choice in option.get("choice", [""]):
+            variants += [{"index": position, "input": value, "choice": choice} for value in inputs]
+    return variants
+
+
+def contrast_state(param, index):
+    """Состояние, отличное от состояния по умолчанию: последний вариант, его ввод и последнее значение выбора."""
+    if "choices" in param:
+        return {"picked": param["choices"][1:] if param["default"] == "all" else param["choices"][:1]}
+    position = len(param["option"]) - 1
+    option = param["option"][position]
+    return {"index": position, "input": filled_input(index) if "input" in option else "",
+            "choice": option.get("choice", [""])[-1]}
+
+
 def variant_states(scenario):
-    """Каждый вариант каждого параметра (с заполненным и пустым значением) при остальных по умолчанию."""
-    defaults = [default_state(param) for param in scenario["params"]]
-    for i, param in enumerate(scenario["params"]):
-        if "choices" in param:
-            options = [[], param["choices"], param["choices"][:1], param["choices"][1:]]
-            variants = [{"picked": picked} for picked in options]
-        else:
-            variants = []
-            for index, option in enumerate(param["option"]):
-                inputs = ["  значение   $& из поля ", ""] if "input" in option else [""]
-                for choice in option.get("choice", [""]):
-                    variants += [{"index": index, "input": value, "choice": choice} for value in inputs]
-        for variant in variants:
-            yield defaults[:i] + [variant] + defaults[i + 1:]
-    if not scenario["params"]:
-        yield []
+    """Наборы состояний параметров сценария:
+    1) все по умолчанию; 2) каждый вариант каждого параметра при остальных по умолчанию (с вводом и пробельными
+    символами); 3) полный перебор сочетаний, если их не больше FULL_LIMIT; 4) все параметры не по умолчанию сразу."""
+    params = scenario["params"]
+    defaults = [default_state(param) for param in params]
+    states = [defaults]
+    for i, param in enumerate(params):
+        states += [defaults[:i] + [variant] + defaults[i + 1:] for variant in param_variants(param, i, True)]
+    if params:
+        combos = [param_variants(param, i, False) for i, param in enumerate(params)]
+        if math.prod(len(c) for c in combos) <= FULL_LIMIT:
+            states += [list(combo) for combo in itertools.product(*combos)]
+        states.append([contrast_state(param, i) for i, param in enumerate(params)])
+    unique = {json.dumps(s, ensure_ascii=False, sort_keys=True): s for s in states}
+    return list(unique.values())
 
 
-def parity_cases(scenarios):
-    return [{"id": s["id"], "states": states, "expected": assemble(s, states or None)}
-            for s in scenarios for states in variant_states(s)]
+def all_variants(scenarios):
+    """(сценарий, состояния, собранный текст) — один раз для проверки длины и меток и для сверки страницы."""
+    return [(s, states, assemble(s, states)) for s in scenarios for states in variant_states(s)]
+
+
+def parity_cases(variants):
+    return [{"id": s["id"], "states": states, "expected": text} for s, states, text in variants]
+
+
+# --- Эталон: ожидаемые строки заданы вручную на синтетической модели, а не выводятся из кода сборки -----------
+
+REFERENCE_PARAMS = [
+    {"key": "Режим", "option": [
+        {"label": "а", "line": "обычный."},
+        {"label": "б", "line": "со вводом: {input}.", "input": "п"},
+        {"label": "в", "line": "в «{choice}»: {input}.", "input": "п", "choice": ["раз", "два"]}]},
+    {"key": "Набор", "choices": ["x", "y", "z"], "default": "none",
+     "all": "все: {selected}.", "none": "ничего: {all}.", "some": "часть: {selected}; остальное: {rest}."},
+    {"key": "Пара", "choices": ["p", "q"], "default": "all", "all": "{all}!", "none": "нет", "some": "{selected}/{rest}"},
+]
+REFERENCE_SCENARIO = {"text": f"до\n\n{PARAMS}\n\nпосле", "params": REFERENCE_PARAMS}
+REFERENCE_CASES = [  # (состояния параметров, ожидаемый текст)
+    (None, "до\n\n## Параметры\n- Режим: обычный.\n- Набор: ничего: x, y, z.\n- Пара: p, q!\n\nпосле"),
+    ([{"index": 1, "input": " \u00a0 привет\t мир\n"}, {"picked": ["y"]}, {"picked": []}],
+     "до\n\n## Параметры\n- Режим: со вводом: привет мир.\n- Набор: часть: y; остальное: x, z.\n- Пара: нет\n\nпосле"),
+    ([{"index": 1, "input": "\ufeff\x85"}, {"picked": ["z", "y", "x"]}, {"picked": ["q"]}],
+     f"до\n\n## Параметры\n- Режим: со вводом: {MISSING}.\n- Набор: все: x, y, z.\n- Пара: q/p\n\nпосле"),
+    ([{"index": 2, "input": "z$&", "choice": "два"}, {"picked": ["z", "x"]}, {"picked": ["p", "q"]}],
+     "до\n\n## Параметры\n- Режим: в «два»: z$&.\n- Набор: часть: x, z; остальное: y.\n- Пара: p, q!\n\nпосле"),
+    ([{"index": 2, "input": "a"}, {"picked": []}, {"picked": ["q", "p"]}],
+     "до\n\n## Параметры\n- Режим: в «раз»: a.\n- Набор: ничего: x, y, z.\n- Пара: p, q!\n\nпосле"),
+]
+REFERENCE_NO_PARAMS = ({"text": f"до\n\n{PARAMS}\n\nпосле", "params": []}, "до\n\nпосле")
+
+
+def check_reference(errors):
+    for number, (states, expected) in enumerate(REFERENCE_CASES, 1):
+        actual = assemble(REFERENCE_SCENARIO, states)
+        if actual != expected:
+            errors.append(f"эталон {number}: ожидалось {expected!r}, собрано {actual!r}")
+    scenario, expected = REFERENCE_NO_PARAMS
+    if assemble(scenario) != expected:
+        errors.append(f"эталон без параметров: ожидалось {expected!r}, собрано {assemble(scenario)!r}")
 
 
 # --- README: таблицы между маркерами -----------------------------------------------------------
 
-def readme_tables(scenarios):
+def or_list(items):
+    return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} или {items[-1]}"
+
+
+def option_label(option):
+    note = ""
+    if "input" in option and "choice" in option:
+        note = f" — со своим значением и выбором: {or_list(option['choice'])}"
+    elif "input" in option:
+        note = " — со своим значением"
+    elif "choice" in option:
+        note = f" — с выбором: {or_list(option['choice'])}"
+    return option["label"].rstrip("…") + note
+
+
+def readme_tables(scenarios, built):
     rows = ["| № | Промпт | Когда | Результат | Чего не делает | Символов |", "|---|---|---|---|---|---:|"]
-    for s in scenarios:
-        size = f"{len(assemble(s)):,}".replace(",", "\u00a0")
+    for s, text in zip(scenarios, built):
+        size = f"{len(text):,}".replace(",", "\u00a0")
         rows.append(f"| {s['num']} | [{s['name']}](prompts/{s['file']}) | {s['when']} | {s['result']} | {s['never']} | {size} |")
     params = ["| Промпт | Параметр | Варианты |", "|---|---|---|"]
     for s in scenarios:
@@ -159,8 +409,7 @@ def readme_tables(scenarios):
                 default = "все отмечены" if param["default"] == "all" else "ничего не отмечено"
                 variants = f"любые из: {', '.join(param['choices'])} (по умолчанию {default})"
             else:
-                labels = [o["label"].rstrip("…") + (" — со своим значением" if "input" in o else "")
-                          for o in param["option"]]
+                labels = [option_label(o) for o in param["option"]]
                 variants = f"{labels[0]} (по умолчанию); " + "; ".join(labels[1:])
             params.append(f"| {s['num']} {s['name']} | {param['key']} | {variants} |")
     return {"scenarios": "\n".join(rows), "params": "\n".join(params)}
@@ -177,38 +426,209 @@ def render_readme(text, tables):
 
 # --- Проверки ----------------------------------------------------------------------------------
 
-def check(scenarios, built, readme):
-    errors = []
-    expected = {f"prompts/{s['file']}": text for s, text in zip(scenarios, built)}
-    actual = {f"prompts/{p.name}": p.read_text(encoding="utf-8") for p in PROMPTS.glob("*.md")}
-    for path in sorted(expected.keys() | actual.keys()):
-        if expected.get(path) != actual.get(path):
-            errors.append(f"{path}: не совпадает со сборкой из src/ — запусти python3 scripts/build.py")
-    if README.read_text(encoding="utf-8") != readme:
-        errors.append("README.md: таблицы не совпадают со сборкой — запусти python3 scripts/build.py")
-    sources = [(f"prompts/{s['file']}", text) for s, text in zip(scenarios, built)]
-    sources += [(str(p.relative_to(ROOT)), p.read_text(encoding="utf-8")) for p in SRC.rglob("*") if p.is_file()]
-    for name, text in sources:
-        for pattern in FORBIDDEN:
-            for match in re.finditer(pattern, text, re.I):
-                line = text.count("\n", 0, match.start()) + 1
-                errors.append(f"{name}:{line}: недопустимое упоминание «{match.group(0)}»")
+LABEL = re.compile(r"\{[a-zа-яё_]+\}|\{\{|\}\}", re.I)  # незаполненная метка в собранном тексте
+FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+INLINE_CODE = re.compile(r"(`+)(?!`).*?(?<!`)\1(?!`)")
+INLINE_LINK = re.compile(r"\]\(\s*(?:<([^>\n]*)>|((?:[^()\s]|\([^()\s]*\))*))")
+REF_DEFINITION = re.compile(r"^ {0,3}\[(?!\^)([^\]\n]+)\]:[ \t]*(?:<([^>\n]*)>|(\S+))", re.M)
+REF_USE = re.compile(r"\[(?!\^)([^\]\n]+)\]\[([^\]\n]*)\]")
+HTML_LINK = re.compile(r"""<(?:img\b[^>]*?\bsrc|a\b[^>]*?\bhref)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.I)
+HTML_ANCHOR = re.compile(r"""<\w+\b[^>]*?\b(?:id|name)\s*=\s*(?:"([^"]+)"|'([^']+)')""", re.I)
+HEADING = re.compile(r"^ {0,3}#{1,6}[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$", re.M)
+CROSS_REF = re.compile(r"(?<!\w)(правил(?:о|а|у|ом|е|ам|ами|ах)?|шаг(?:а|у|ом|е|и|ов|ам|ами|ах)?)\s+"
+                       r"(\d+(?:\s*(?:,|и|или|–|—|-)\s*\d+)*)", re.I)
+
+
+def repo_files():
+    """Тексты проверяемых файлов: путь от корня → текст. Фиксированные корни, без git и без обхода всего дерева, чтобы
+    неотслеживаемые файлы не давали красной проверки: *.md в корне и в docs/, src/, .github/ (собранный prompts/ не
+    входит), *.toml — из src/."""
+    paths = list(ROOT.glob("*.md"))
+    for folder in ("docs", "src", ".github"):
+        paths += (ROOT / folder).rglob("*.md")
+    paths += SRC.rglob("*.toml")
+    return {path.relative_to(ROOT).as_posix(): read(path) for path in sorted(set(paths)) if path.is_file()}
+
+
+def line_of(text, offset):
+    return text.count("\n", 0, offset) + 1
+
+
+def strip_code(text):
+    """Текст без кода: блоки и фрагменты заменены пробелами, номера строк и смещения сохранены."""
+    lines, fence = [], None
+    for line in text.split("\n"):
+        if fence is None:
+            opening = FENCE.match(line)
+            if opening:
+                fence = opening.group(1)
+                line = " " * len(line)
+            else:
+                line = INLINE_CODE.sub(lambda m: " " * len(m.group(0)), line)
+        else:
+            if re.fullmatch(rf" {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*", line):
+                fence = None
+            line = " " * len(line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def slug(heading):
+    """Якорь заголовка по правилам GitHub: без разметки, строчные буквы, из знаков только дефис и подчеркивание."""
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", heading)
+    text = re.sub(r"<[^>]+>", "", text.replace("`", "")).strip().lower()
+    text = re.sub(r"(?<!\w)_+(?=\w)|(?<=\w)_+(?!\w)", "", text)  # _курсив_; подчеркивания внутри слов остаются
+    return re.sub(r"[^\w\- ]", "", text).replace(" ", "-")
+
+
+def anchors(text):
+    """Якоря Markdown-текста: заголовки (повтор получает суффикс -1, -2…) и HTML-атрибуты id и name.
+    Заголовки с подчеркиванием строкой (setext) не распознаются: ссылка на такой заголовок будет ложно битой.
+    Ограничение slug: подчеркивание у границы слова считается курсивом (заголовок «_private» получит якорь «private»)."""
+    code_free = strip_code(text)
+    found, seen = set(), {}
+    for match in HEADING.finditer(code_free):
+        base = slug(text[match.start(1):match.end(1)])  # найден в тексте без кода, а слова берутся из исходника
+        found.add(base if base not in seen else f"{base}-{seen[base]}")
+        seen[base] = seen.get(base, 0) + 1
+    found.update((a or b).lower() for a, b in (m.groups() for m in HTML_ANCHOR.finditer(code_free)))
+    return found
+
+
+def check_links(files, errors):
+    """Ссылки во всех Markdown-файлах: inline, по определению, <img src>, <a href>; файлы и якоря должны существовать.
+    Внешние (со схемой или //хост) не открываются."""
+    cache = {}
+
+    def anchors_of(path):
+        if path not in cache:
+            rel = path.relative_to(ROOT).as_posix()
+            cache[path] = anchors(files[rel] if rel in files else read(path))
+        return cache[path]
+
+    def problem(doc, target):
+        if target.startswith("//") or re.match(r"[A-Za-z][A-Za-z0-9+.-]*:", target):
+            return None
+        route, _, fragment = target.partition("#")
+        route = unquote(route.partition("?")[0])
+        if route:
+            base = ROOT if route.startswith("/") else (ROOT / doc).parent
+            path = Path(os.path.normpath(base / route.lstrip("/")))
+            if ROOT != path and ROOT not in path.parents:
+                return "ведет за пределы репозитория"
+            if not path.exists():
+                return "нет такого файла"
+        else:
+            path = ROOT / doc
+        if fragment and path.suffix == ".md" and path.is_file() and unquote(fragment).lower() not in anchors_of(path):
+            return f"нет якоря #{fragment}" + ("" if route else " в этом файле")
+        return None
+
+    for doc, text in files.items():
+        if not doc.endswith(".md"):
+            continue
+        body = strip_code(text)
+        labels = {" ".join(m.group(1).split()).casefold() for m in REF_DEFINITION.finditer(body)}
+        targets = [(m.start(), m.group(1) if m.group(1) is not None else m.group(2)) for m in INLINE_LINK.finditer(body)]
+        targets += [(m.start(), m.group(2) if m.group(2) is not None else m.group(3)) for m in REF_DEFINITION.finditer(body)]
+        targets += [(m.start(), next(g for g in m.groups() if g is not None)) for m in HTML_LINK.finditer(body)]
+        for offset, target in sorted(targets):
+            reason = problem(doc, target)
+            if reason:
+                errors.append(f"{doc}:{line_of(body, offset)}: битая ссылка {target}: {reason}")
+        for match in REF_USE.finditer(body):
+            label = " ".join((match.group(2) or match.group(1)).split()).casefold()
+            if label not in labels:
+                errors.append(f"{doc}:{line_of(body, match.start())}: ссылка [{match.group(2) or match.group(1)}] без определения")
+
+
+def numbered(text):
+    """Номера пунктов нумерованных списков."""
+    return {int(n) for n in re.findall(r"^[ \t]{0,3}(\d+)\.\s", text, re.M)}
+
+
+def strings(value, path=""):
+    """Все строки значения TOML с путем к ним, например param[2].option[1].line."""
+    if isinstance(value, str):
+        yield path, value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from strings(item, f"{path}.{key}" if path else key)
+    elif isinstance(value, list):
+        for number, item in enumerate(value, 1):
+            yield from strings(item, f"{path}[{number}]")
+
+
+def check_numbers(scenarios, rules, errors):
+    """«Правило N» и «шаг N» ссылаются на существующий пункт: правила — нумерованный список src/rules.md; шаги — списки
+    сценария, к которому относится текст. Общие правила попадают в каждый сценарий, поэтому шаг из них должен быть везде."""
+    rule_numbers = numbered(rules)
+    steps = {s["file"]: numbered(s["source"]) for s in scenarios}
+
+    def verify(place, text, files):
+        for match in CROSS_REF.finditer(text):
+            is_rule = match.group(1).lower().startswith("правил")
+            numbers, previous, dash = [], None, False
+            for token in re.findall(r"\d+|[–—-]", match.group(2)):  # «4 и 5», «4, 5», «4–6»
+                if token.isdigit():
+                    value = int(token)
+                    numbers += range(previous + 1, value + 1) if dash else [value]
+                    previous, dash = value, False
+                else:
+                    dash = True
+            for number in numbers:
+                lacking = [] if not is_rule or number in rule_numbers else ["src/rules.md"]
+                lacking += [] if is_rule else [file for file in files if number not in steps[file]]
+                if lacking:
+                    errors.append(f"{place(match)}: «{match.group(0)}» — нет {'правила' if is_rule else 'шага'} {number} "
+                                  f"в {', '.join(lacking)}")
+
+    verify(lambda m: f"src/rules.md:{line_of(rules, m.start())}", rules, list(steps))
     for s in scenarios:
-        for states in variant_states(s):
-            text = assemble(s, states or None)
-            if re.search(r"\{[a-zа-яё_]+\}|\{\{|\}\}", text):
-                errors.append(f"{s['file']}: незаполненная метка при вариантах {states}")
-            if len(text) > PROMPT_LIMIT:
-                errors.append(f"{s['file']}: {len(text)} символов при вариантах {states}, предел {PROMPT_LIMIT}")
+        verify(lambda m, s=s: f"src/scenarios/{s['file']}:{line_of(s['source'], m.start())}", s["source"], [s["file"]])
+        for path, text in strings({key: s[key] for key in SCENARIO_KEYS if key in s}):
+            verify(lambda m, path=path, s=s: f"scenarios.toml, {s['file']}, {path}", text, [s["file"]])
+
+
+def describe(states):
+    return "по умолчанию" if states is None else json.dumps(states, ensure_ascii=False)[:200]
+
+
+def check(scenarios, rules, built, variants, files, readme, current_readme):
+    errors = []
+    # Собранное совпадает с файлами в репозитории.
+    expected = {f"prompts/{s['file']}": text for s, text in zip(scenarios, built)}
+    actual = {f"prompts/{p.name}": read(p) for p in PROMPTS.glob("*.md")}
+    stale = [path for path in sorted(expected.keys() | actual.keys()) if expected.get(path) != actual.get(path)]
+    if current_readme != readme:
+        stale.append("README.md")
+    if stale:
+        errors.append(f"{', '.join(stale)}: не совпадает со сборкой из src/ — запусти python3 scripts/build.py")
+    # Названия клиентов, моделей и версий — только в src/: промпты и страница собраны из него.
+    for name, text in files.items():
+        if name.startswith("src/"):
+            for pattern in FORBIDDEN:
+                for match in pattern.finditer(text):
+                    errors.append(f"{name}:{line_of(text, match.start())}: недопустимое упоминание «{match.group(0)}»")
+    for sample, forbidden in FORBIDDEN_SAMPLES:
+        if any(p.search(sample) for p in FORBIDDEN) != forbidden:
+            errors.append(f"FORBIDDEN: «{sample}» должно {'запрещаться' if forbidden else 'проходить'}")
+    # Предел длины и метки: по умолчанию и на всех вариантах, одна строка на сценарий и причину.
     for s, text in zip(scenarios, built):
-        if len(text) > PROMPT_LIMIT:
-            errors.append(f"prompts/{s['file']}: {len(text)} символов, предел {PROMPT_LIMIT}")
-        if "{{" in text or "}}" in text:
-            errors.append(f"prompts/{s['file']}: осталась неподставленная метка")
-    for doc in ("README.md", "AGENTS.md"):
-        for target in re.findall(r"\]\(<?([^)#\s>]+)", (ROOT / doc).read_text(encoding="utf-8")):
-            if not re.match(r"[a-z]+:", target) and not (ROOT / target).exists():
-                errors.append(f"{doc}: битая ссылка {target}")
+        texts = [(None, text)] + [(states, t) for v, states, t in variants if v is s]
+        long = [(len(t), states) for states, t in texts if len(t) > PROMPT_LIMIT]
+        if long:
+            size, states = max(long, key=lambda item: item[0])
+            errors.append(f"{s['file']}: {len(long)} из {len(texts)} вариантов длиннее {PROMPT_LIMIT}; "
+                          f"худший — {size} символов при состояниях: {describe(states)}")
+        unfilled = [(sorted({m.group(0) for m in LABEL.finditer(t)}), states) for states, t in texts if LABEL.search(t)]
+        if unfilled:
+            labels, states = unfilled[0]
+            errors.append(f"{s['file']}: незаполненные метки {', '.join(labels)} в {len(unfilled)} из {len(texts)} вариантов, "
+                          f"например при состояниях: {describe(states)}")
+    check_reference(errors)
+    check_links(files, errors)
+    check_numbers(scenarios, rules, errors)
     return errors
 
 
@@ -299,7 +719,7 @@ def build_site(scenarios, built, out):
                    f'<span class="name">{html.escape(s["name"])}</span></a></li>' for s in scenarios)
     sha = os.environ.get("GITHUB_SHA", "")[:7]
     built_from = f' Собрано из коммита <a href="https://github.com/{REPO}/commit/{sha}">{sha}</a>.' if sha else ""
-    page = (TEMPLATE.replace("@RAIL@", rail)
+    page = (TEMPLATE.replace("@WHITESPACE@", WHITESPACE).replace("@RAIL@", rail)
             .replace("@SECTIONS@", "".join(scenario_section(s, t) for s, t in zip(scenarios, built)))
             .replace("@DATA@", json.dumps({"missing": MISSING, "scenarios": data}, ensure_ascii=False).replace("</", "<\\/"))
             .replace("@ICON_AUTO@", ICON["auto"]).replace("@ICON_SUN@", ICON["sun"]).replace("@ICON_MOON@", ICON["moon"])
@@ -315,11 +735,13 @@ def main():
     parser.add_argument("--site", type=Path, help="каталог для страницы GitHub Pages")
     parser.add_argument("--parity-cases", type=Path, help="записать случаи для scripts/parity.mjs")
     args = parser.parse_args()
-    scenarios = load()
+    scenarios, rules = load()
     built = [assemble(s) for s in scenarios]
-    readme = render_readme(README.read_text(encoding="utf-8"), readme_tables(scenarios))
+    current_readme = read(README)
+    readme = render_readme(current_readme, readme_tables(scenarios, built))
+    variants = all_variants(scenarios) if args.check or args.parity_cases else []
     if args.check:
-        errors = check(scenarios, built, readme)
+        errors = check(scenarios, rules, built, variants, repo_files(), readme, current_readme)
         for s, text in zip(scenarios, built):
             print(f"prompts/{s['file']}: {len(text)} символов")
         if errors:
@@ -338,7 +760,8 @@ def main():
     if args.site:
         build_site(scenarios, built, args.site)
     if args.parity_cases:
-        args.parity_cases.write_text(json.dumps(parity_cases(scenarios), ensure_ascii=False), encoding="utf-8")
+        args.parity_cases.write_text(json.dumps(parity_cases(variants), ensure_ascii=False), encoding="utf-8")
+        print(f"{args.parity_cases}: случаев {len(variants)}")
 
 
 TEMPLATE = r"""<!doctype html>
@@ -644,9 +1067,12 @@ footer p { margin: 0; max-width: 46rem; }
 <script type="application/json" id="data">@DATA@</script>
 <script id="logic">
 // Сборка текста промпта: та же логика, что param_text и assemble в scripts/build.py.
-// CI сверяет их на всех вариантах параметров (scripts/parity.mjs).
+// CI сверяет их (scripts/parity.mjs): каждый вариант каждого параметра при остальных по умолчанию, сочетания
+// параметров и ввод с разными пробельными символами.
 var playbook = (() => {
-  const clean = (value) => value.trim().replace(/\s+/g, " ");
+  // Пробельные символы те же, что в WHITESPACE в build.py: сборка подставляет их на место метки.
+  const spaces = /[@WHITESPACE@]+/g;
+  const clean = (value) => value.replace(spaces, " ").replace(/^ | $/g, "");
   // Замена функцией: строка замены разбирала бы шаблоны вида $& во вводе.
   const put = (text, token, value) => text.replaceAll(token, () => value);
   function paramText(param, state, missing) {
