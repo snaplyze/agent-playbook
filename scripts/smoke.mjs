@@ -16,8 +16,16 @@
 //
 // Страница отдается локальным сервером на 127.0.0.1; внешние запросы блокируются и записываются: тест не зависит от
 // сети. Анимации выключены эмуляцией prefers-reduced-motion: клики попадают в уже разложенные элементы.
+//
+// Копирование без запасного пути не работает там, где нет Clipboard API, поэтому проверяются оба сбоя: API нет совсем
+// (удален до загрузки страницы) и запись отклонена; в обоих текст выделен, подсказка показана, а Ctrl+C кладет в буфер
+// ровно показанный текст. Предел длины промпта (limit в данных страницы): сверх него у счетчика пометка в обеих темах и
+// одно объявление для чтения с экрана, в пределах пометки нет, копирование не блокируется.
+//
+// Windows: системный буфер там хранит переводы строк как CRLF, поэтому текст из буфера приводится к LF (текст <pre> и
+// скачанный файл сравниваются как есть), а дерево процессов Chrome завершается через taskkill.
 import { spawn } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { accessSync, constants, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
@@ -30,6 +38,7 @@ const QUIET = 250; // сколько ждать, чтобы убедиться, 
 const SHOWN = 12; // сколько расхождений печатать подробно
 const CHROME_NAMES = ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"];
 const SENTINEL = "smoke: содержимое буфера до проверки";
+const IS_WINDOWS = process.platform === "win32";
 
 const started = Date.now();
 const cleanups = [];
@@ -173,24 +182,40 @@ async function launch(bin, extraFlags, profile) {
     child.on("exit", (code, signal) => { exited = { code, signal }; done(); });
     child.on("error", (error) => { exited = { code: null, signal: null, error }; done(); });
   });
+  // Очистка знает о Chrome сразу после запуска: сбой на старте тоже завершает его до удаления профиля.
+  cleanups.push(async () => {
+    await killTree(child);
+    await Promise.race([gone, sleep(5_000)]); // профиль удаляется только после выхода Chrome
+  });
   const portFile = join(profile, "DevToolsActivePort");
   const until = Date.now() + 20_000;
   while (Date.now() < until) {
     if (exited) break;
-    if (existsSync(portFile)) {
-      const [port, path] = readText(portFile).split("\n");
-      if (port && path) return { child, gone, wsUrl: `ws://127.0.0.1:${port}${path}` };
+    let text = "";
+    try {
+      text = readFileSync(portFile, "utf8");
+    } catch {
+      // Файла еще нет или Chrome его пишет (на Windows чтение дает EBUSY): ждем дальше.
     }
+    const [port, path] = text.split("\n");
+    if (port && path) return { child, gone, wsUrl: `ws://127.0.0.1:${port}${path}` };
     await sleep(40);
   }
   const early = Boolean(exited && !exited.error); // завершился сам, не успев открыть порт: признак отказа песочницы
   const why = exited ? `завершился сразу (код ${exited.code ?? exited.signal ?? exited.error?.message})` : "не открыл порт за 20 с";
-  killTree(child);
+  await killTree(child);
   await Promise.race([gone, sleep(3_000)]);
   return { error: `Chrome ${why}${stderr.trim() ? `:\n${stderr.trim()}` : ""}`, early };
 }
 
-function killTree(child) {
+// Завершает Chrome вместе со вспомогательными процессами и ждет, пока это произойдет: до тех пор профиль занят.
+async function killTree(child) {
+  if (IS_WINDOWS) {
+    // Групп процессов нет: taskkill завершает дерево по идентификатору корня.
+    await new Promise((done) => spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
+      .on("error", done).on("exit", done));
+    return;
+  }
   for (const signal of ["SIGTERM", "SIGKILL"]) {
     try {
       process.kill(-child.pid, signal); // вся группа: Chrome порождает вспомогательные процессы
@@ -266,7 +291,8 @@ async function waitFor(predicate, what, timeout = WAIT_TIMEOUT) {
 // --- Запуск ----------------------------------------------------------------------------------------
 
 const temp = mkdtempSync(join(tmpdir(), "playbook-smoke-"));
-cleanups.push(() => rmSync(temp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+// Профиль Chrome может оставаться занятым доли секунды после выхода процессов (на Windows это EBUSY): удаление с повторами.
+cleanups.push(() => rmSync(temp, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 }));
 
 const server = createServer((request, response) => {
   const path = (request.url ?? "").split("?")[0];
@@ -294,10 +320,6 @@ if (launched.error) {
   console.error("smoke: Chrome с песочницей не стартовал, запущен с --no-sandbox");
   launched = retry;
 }
-cleanups.push(async () => {
-  killTree(launched.child);
-  await Promise.race([launched.gone, sleep(5_000)]); // профиль удаляется только после выхода Chrome
-});
 
 const cdp = await Cdp.connect(launched.wsUrl);
 const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
@@ -346,6 +368,8 @@ await page("Fetch.enable", { patterns: [{ urlPattern: "*" }] });
 // Нарушения CSP страницы: событие securitypolicyviolation собирается с самого начала загрузки документа.
 await page("Page.addScriptToEvaluateOnNewDocument", { source: `window.__violations = [];
   document.addEventListener("securitypolicyviolation", (e) => window.__violations.push(e.violatedDirective + " " + (e.blockedURI || e.sample || "")), true);` });
+// Страница по адресу /?no-clipboard открывается без Clipboard API: он удален до выполнения ее скриптов, как в небезопасном контексте.
+await page("Page.addScriptToEvaluateOnNewDocument", { source: `if (location.search === "?no-clipboard") delete Navigator.prototype.clipboard;` });
 await page("Emulation.setDeviceMetricsOverride", { width: 1280, height: 1000, deviceScaleFactor: 1, mobile: false });
 await page("Emulation.setFocusEmulationEnabled", { enabled: true });
 await page("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
@@ -440,13 +464,28 @@ async function applyStates(scenario, states) {
   }
 }
 
-const clipboard = () => ev("navigator.clipboard.readText()", { awaitPromise: true, userGesture: true });
+// Текст из системного буфера: конвенция платформы (CRLF на Windows) не дефект страницы, остальное сравнивается как есть.
+const fromSystem = (text) => IS_WINDOWS ? text.replace(/\r\n/g, "\n") : text;
+const clipboard = async () => fromSystem(await ev("navigator.clipboard.readText()", { awaitPromise: true, userGesture: true }));
 const setClipboard = (text) => ev(`navigator.clipboard.writeText(${show(text)})`, { awaitPromise: true, userGesture: true });
 
 async function copy(scenario) {
   await setClipboard(SENTINEL);
+  // Прежние выделение и уведомления не должны скрыть запасной путь, сработавший при успешной записи.
+  await ev(`getSelection().removeAllRanges(); document.querySelectorAll(".toast").forEach((t) => t.remove())`);
   await click(`#${scenario.id} [data-action="copy"]`);
-  return waitFor(async () => { const text = await clipboard(); return text !== SENTINEL && text; }, "буфер не изменился");
+  const text = await waitFor(async () => { const text = await clipboard(); return text !== SENTINEL && text; }, "буфер не изменился");
+  // Запись удалась: кнопка «Скопировано», выделения и подсказки про Ctrl+C нет (запасной путь молчит).
+  const after = await waitFor(() => ev(`(() => {
+    const label = document.querySelector("#${scenario.id} [data-action='copy'] .btn-label").textContent;
+    if (label === "Скопировать промпт") return null;
+    return { label, collapsed: getSelection().isCollapsed, hint: [...document.querySelectorAll(".toast.warn")].some((t) => t.textContent.includes("Ctrl+C")) };
+  })()`), "кнопка не показала результат копирования");
+  const where = `${scenario.id} копирование`;
+  ok(after.label === "Скопировано", where, `метка кнопки после успешной записи ${show(after.label)}`);
+  ok(after.collapsed, where, "после успешной записи текст выделен");
+  ok(!after.hint, where, "после успешной записи показана подсказка про Ctrl+C");
+  return text;
 }
 
 async function download(scenario) {
@@ -455,8 +494,10 @@ async function download(scenario) {
   const before = downloads.length;
   await click(`#${scenario.id} [data-action="download"]`);
   const item = await waitFor(() => downloads.slice(before).find((d) => d.state === "completed"), "скачивание не завершилось");
-  const files = readdirSync(dir);
-  if (!(files.length === 1 && files[0] === item.suggestedFilename)) throw new Error(`в каталоге скачивания ${show(files)}, ожидался ${show(item.suggestedFilename)}`);
+  // Скачивания страницы считаются по событиям браузера, а не по каталогу: Chrome на Windows иногда кладет туда
+  // свой служебный downloads.htm, который страница не скачивала.
+  const started = downloads.slice(before);
+  if (started.length !== 1) throw new Error(`скачиваний ${started.length}, ожидалось одно: ${show(started.map((d) => `${d.suggestedFilename} ← ${d.url}`))}`);
   return { name: item.suggestedFilename, text: readFileSync(join(dir, item.suggestedFilename), "utf8") };
 }
 
@@ -627,8 +668,147 @@ for (const scenario of scenarios) {
 ok(areaChecks > 0, "область", "не проверено сохранение области при смене варианта");
 ok(driven > 0, "случаи", "не воспроизведено ни одного случая из cases.json");
 
+// --- Запасной путь копирования -------------------------------------------------------------------------------
+
+// Нарушения CSP собираются по каждому документу: перед уходом со страницы они переносятся в общий список.
+const violations = [];
+const takeViolations = async () => violations.push(...await ev("window.__violations"));
+const pressCopy = async () => {
+  await page("Input.dispatchKeyEvent", { type: "keyDown", key: "c", code: "KeyC", modifiers: 2, commands: ["copy"] });
+  await page("Input.dispatchKeyEvent", { type: "keyUp", key: "c", code: "KeyC", modifiers: 2 });
+};
+async function loadPage(path) {
+  await takeViolations();
+  await page("Page.navigate", { url: `${origin}${path}` });
+  await waitFor(() => ev(`location.search === ${show(path.slice(1))} && document.readyState === "complete" && document.documentElement.classList.contains("js")`), `страница ${path} не загрузилась`, 20_000);
+}
+
+// Клик «Скопировать» там, где запись в буфер не удалась: текст выделен целиком, подсказка показана, исключений нет;
+// после этого Ctrl+C кладет в буфер ровно показанный текст. Читать буфер можно только со страницы с API: вызывает сам случай.
+async function fallbackCopy(scenario, where) {
+  const errors = pageErrors.length;
+  await click(`#${scenario.id} [data-action="copy"]`);
+  const state = await waitFor(() => ev(`(() => {
+    const label = document.querySelector("#${scenario.id} [data-action='copy'] .btn-label").textContent;
+    if (label !== "Выделено") return null;
+    return { selected: getSelection().toString(), shown: document.querySelector("#${scenario.id} .prompt").textContent,
+      hint: [...document.querySelectorAll(".toasts .toast.warn")].some((t) => t.textContent.includes("Ctrl+C")) };
+  })()`), "после клика нет выделения и подсказки");
+  ok(state.hint, where, "нет подсказки про Ctrl+C в области уведомлений");
+  sameText(state.selected, state.shown, where, "выделенный текст не совпадает с показанным (завершающий перевод строки)");
+  ok(pageErrors.length === errors, where, `при копировании возникли ошибки: ${pageErrors.slice(errors).join("; ")}`);
+  await pressCopy();
+  return state.shown;
+}
+
+try {
+  const scenario = scenarios[0];
+  await openScenario(scenario);
+  await applyStates(scenario, defaultStates(scenario)); // прежние проверки могли оставить пустое обязательное поле
+  // Запись отклонена: Clipboard API есть, но writeText отвергает вызов (запрет разрешения).
+  await setClipboard(SENTINEL);
+  await ev(`navigator.clipboard.writeText = () => Promise.reject(new DOMException("denied", "NotAllowedError"))`);
+  let shown;
+  try {
+    shown = await fallbackCopy(scenario, "копирование при отказе записи");
+  } finally {
+    await ev(`delete navigator.clipboard.writeText`);
+  }
+  sameText(await waitFor(async () => { const text = await clipboard(); return text !== SENTINEL && text; }, "Ctrl+C не изменил буфер"), shown, "копирование при отказе записи", "Ctrl+C после выделения: в буфере не показанный текст");
+
+  // Clipboard API нет совсем.
+  await setClipboard(SENTINEL);
+  await loadPage("/?no-clipboard");
+  ok(await ev(`navigator.clipboard === undefined`), "копирование без Clipboard API", "в странице остался navigator.clipboard");
+  await openScenario(scenario);
+  const bare = await fallbackCopy(scenario, "копирование без Clipboard API");
+  await loadPage("/");
+  sameText(await waitFor(async () => { const text = await clipboard(); return text !== SENTINEL && text; }, "Ctrl+C не изменил буфер"), bare, "копирование без Clipboard API", "Ctrl+C после выделения: в буфере не показанный текст");
+} catch (error) {
+  fault("запасной путь копирования", `тест прерван: ${error.message}`);
+}
+
+// --- Предел длины промпта ---------------------------------------------------------------------------------------
+
+try {
+  const limit = data.limit;
+  ok(Number.isInteger(limit) && limit > 0, "предел длины", `в данных страницы нет предела: ${show(limit)}`);
+  const scenario = scenarios.find((s) => s.params.some((p) => p.option?.some((o) => o.input !== undefined)));
+  const i = scenario.params.findIndex((p) => p.option?.some((o) => o.input !== undefined));
+  const index = scenario.params[i].option.findIndex((o) => o.input !== undefined);
+  const where = `предел длины ${scenario.id}`;
+  const input = `${field(scenario, i)} .extra-input`;
+  const reset = `#${scenario.id} [data-action="reset"]`;
+  // Счетчик: пометка, текст с пределом и цвета предупреждения; цвета палитры читаются из переменных CSS темы.
+  const counter = () => ev(`(() => {
+    const meta = document.querySelector("#${scenario.id} .meta");
+    const probe = Object.assign(document.createElement("i"), { style: "color: var(--warn); background-color: var(--warn-wash)" });
+    document.body.append(probe);
+    const want = getComputedStyle(probe);
+    const result = { over: meta.classList.contains("is-over"), text: meta.textContent, tinted: getComputedStyle(meta).color === want.color && getComputedStyle(meta).backgroundColor === want.backgroundColor };
+    probe.remove();
+    return result;
+  })()`);
+  // Объявления считаются событиями, а не по тостам в DOM: тост живет несколько секунд и переживает фазы теста.
+  await ev(`window.__notices = 0;
+    new MutationObserver((records) => records.forEach((r) => r.addedNodes.forEach((n) => {
+      if (n.classList?.contains("warn") && n.textContent.includes("длиннее")) window.__notices += 1;
+    }))).observe(document.querySelector(".toasts"), { childList: true })`);
+  const announced = async (phase, expected, action) => {
+    await ev(`window.__notices = 0`);
+    await action();
+    const got = await ev(`window.__notices`);
+    ok(got === expected, `${where} ${phase}`, `объявлений о превышении ${got}, ожидалось ${expected} (одно при каждом пересечении предела, без повтора на каждый символ)`);
+  };
+  const exceed = async (extra) => {
+    await type(input, "а".repeat(limit + 100 + extra));
+    return waitFor(async () => { const c = await counter(); return c.over && c; }, "пометка о превышении предела не появилась");
+  };
+  const within = async () => {
+    await type(input, "а");
+    return waitFor(async () => { const c = await counter(); return !c.over && c; }, "пометка осталась при тексте в пределах");
+  };
+  const digits = (text) => text.replace(/\D/g, "");
+
+  await openScenario(scenario);
+  await applyStates(scenario, defaultStates(scenario));
+  ok(!(await counter()).over, where, "пометка есть у промпта по умолчанию");
+  await choose(scenario, i, index);
+  for (const scheme of ["light", "dark"]) {
+    await page("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }, { name: "prefers-color-scheme", value: scheme }] });
+    // Светлая фаза пересекает предел (одно объявление); в темной текст остается сверх предела (объявлений нет).
+    let long;
+    await announced(scheme, scheme === "light" ? 1 : 0, async () => { long = await exceed(scheme === "dark" ? 1 : 0); });
+    ok(digits(long.text).endsWith(String(limit)), `${where} (${scheme})`, `в пометке нет предела ${limit}: ${show(long.text)}`);
+    ok(long.tinted, `${where} (${scheme})`, "пометка не окрашена цветами предупреждения (--warn, --warn-wash)");
+    ok((await shownText(scenario)).length > limit, where, "текст не превышает предел: проверка не проверяет превышение");
+  }
+  await page("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
+  ok(await ev(`document.querySelector(".toasts").matches('[role="status"][aria-live="polite"]')`), where, "область уведомлений не объявляется для чтения с экрана");
+  // Копирование и скачивание не заблокированы.
+  const longText = await shownText(scenario);
+  sameText(await copy(scenario), longText, where, "в буфере не тот текст, что показан, при превышении");
+  sameText((await download(scenario)).text, longText, where, "в файле не тот текст, что показан, при превышении");
+  // Возврат в пределы снимает пометку и не объявляется; новое превышение объявляется снова.
+  let short;
+  await announced("возврат в предел", 0, async () => { short = await within(); });
+  ok(!/больше/.test(short.text) && !short.tinted, where, `в пределах счетчик похож на пометку: ${show(short.text)}`);
+  ok((await shownText(scenario)).length <= limit, where, "текст в пределах длиннее предела");
+  await announced("повторное превышение", 1, () => exceed(2));
+  // То же после сброса: он возвращает в предел, а следующее превышение снова объявляется.
+  await announced("сброс", 0, async () => {
+    await click(reset);
+    await waitFor(async () => !(await counter()).over, "пометка осталась после сброса");
+  });
+  await choose(scenario, i, index);
+  await announced("превышение после сброса", 1, () => exceed(3));
+  await click(reset);
+} catch (error) {
+  fault("предел длины", `тест прерван: ${error.message}`);
+}
+await takeViolations();
+
 ok(externalRequests.length === 0, "сеть", `внешние запросы со страницы:\n    ${externalRequests.join("\n    ")}`);
-const violations = await ev("window.__violations");
 ok(violations.length === 0, "CSP", `нарушения политики страницы:\n    ${violations.join("\n    ")}`);
 ok(pageErrors.length === 0, "консоль", `ошибки на странице:\n    ${pageErrors.join("\n    ")}`);
 

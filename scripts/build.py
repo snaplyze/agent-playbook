@@ -827,7 +827,7 @@ def render_site(scenarios, built):
         "APP": fill(source["app.js"], {}, "app.js"),
         "RAIL": rail,
         "SECTIONS": "".join(scenario_section(s, t) for s, t in zip(scenarios, built)),
-        "DATA": json.dumps({"missing": MISSING, "scenarios": data}, ensure_ascii=False).translate(JSON_ESCAPES),
+        "DATA": json.dumps({"missing": MISSING, "limit": PROMPT_LIMIT, "scenarios": data}, ensure_ascii=False).translate(JSON_ESCAPES),
         "ICON_AUTO": ICON["auto"], "ICON_SUN": ICON["sun"], "ICON_MOON": ICON["moon"],
         "REPO": html.escape(REPO), "BUILT": built_from,
     }, "page.html")

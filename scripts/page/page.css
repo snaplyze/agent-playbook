@@ -184,6 +184,7 @@ html:not(.js) .params, html:not(.js) .theme { display: none; }
 .btn.is-done .btn-icons .icon-check { opacity: 1; scale: 1; rotate: 0deg; }
 .btn.is-done, .btn.is-done:hover { background: var(--ok); border-color: var(--ok); color: var(--on-ok); }
 .meta { margin-left: auto; font-size: 14px; font-variant-numeric: tabular-nums; color: var(--ink-soft); }
+.meta.is-over { padding: 3px 10px; border-radius: var(--r1); background: var(--warn-wash); color: var(--warn); font-weight: 600; }
 
 .prompt { margin: 0; padding: clamp(16px, 3vw, 28px) clamp(16px, 3vw, 32px); background: var(--sheet); border: 1px solid var(--rule); border-radius: var(--r3); font: 400 14px/1.7 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2; }
 .prompt .h { font-weight: 600; color: var(--ink); }
