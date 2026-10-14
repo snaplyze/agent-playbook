@@ -10,10 +10,12 @@
 // варианта в комбобоксе, ввод с лишними пробелами, выбор области, снятие и установка чипов дают текст случая из
 // cases.json; пустое обязательное поле блокирует копирование и скачивание и подсвечивается; копирование кладет в
 // буфер ровно показанный текст, скачивание дает файл NN-имя.md с тем же текстом; сброс возвращает умолчания,
-// очищает ввод и восстанавливает чипы; на странице нет исключений и ошибок консоли.
+// очищает ввод и восстанавливает чипы; на странице нет исключений и ошибок консоли; страница не делает внешних запросов
+// (любой запрос не к локальному серверу — провал; data: и blob: сетью не считаются) и не нарушает свою политику CSP
+// (событие securitypolicyviolation и записи журнала), а политика в ней есть и не разрешает небезопасного.
 //
-// Страница отдается локальным сервером на 127.0.0.1. Внешние запросы (шрифты) подменяются пустым ответом: тест не
-// зависит от сети. Анимации выключены эмуляцией prefers-reduced-motion: клики попадают в уже разложенные элементы.
+// Страница отдается локальным сервером на 127.0.0.1; внешние запросы блокируются и записываются: тест не зависит от
+// сети. Анимации выключены эмуляцией prefers-reduced-motion: клики попадают в уже разложенные элементы.
 import { spawn } from "node:child_process";
 import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createServer } from "node:http";
@@ -303,7 +305,9 @@ const { sessionId: sid } = await cdp.send("Target.attachToTarget", { targetId, f
 const page = (method, params) => cdp.send(method, params, sid);
 
 // Ошибки страницы: необработанные исключения, console.error/assert и записи журнала уровня error.
+// Внешние запросы: все, кроме локального сервера и адресов без сети (data:, blob:, about:).
 const pageErrors = [];
+const externalRequests = [];
 cdp.on((message) => {
   if (message.sessionId !== sid) return;
   const { method, params } = message;
@@ -315,12 +319,12 @@ cdp.on((message) => {
   } else if (method === "Log.entryAdded" && params.entry.level === "error") {
     pageErrors.push(`журнал: ${params.entry.text} ${params.entry.url ?? ""}`);
   } else if (method === "Fetch.requestPaused") {
-    const local = params.request.url.startsWith(origin);
-    // Внешнее (шрифты) отдаем пустым; свое пропускаем.
+    const url = params.request.url;
+    const local = url.startsWith(`${origin}/`) || /^(?:data|blob|about):/.test(url);
+    if (!local) externalRequests.push(url);
     (local
       ? page("Fetch.continueRequest", { requestId: params.requestId })
-      : page("Fetch.fulfillRequest", { requestId: params.requestId, responseCode: 200,
-        responseHeaders: [{ name: "content-type", value: "text/css" }], body: "" }))
+      : page("Fetch.failRequest", { requestId: params.requestId, errorReason: "BlockedByClient" }))
       .catch((error) => pageErrors.push(`Fetch: ${error.message}`));
   }
 });
@@ -339,6 +343,9 @@ await page("Page.enable");
 await page("Runtime.enable");
 await page("Log.enable");
 await page("Fetch.enable", { patterns: [{ urlPattern: "*" }] });
+// Нарушения CSP страницы: событие securitypolicyviolation собирается с самого начала загрузки документа.
+await page("Page.addScriptToEvaluateOnNewDocument", { source: `window.__violations = [];
+  document.addEventListener("securitypolicyviolation", (e) => window.__violations.push(e.violatedDirective + " " + (e.blockedURI || e.sample || "")), true);` });
 await page("Emulation.setDeviceMetricsOverride", { width: 1280, height: 1000, deviceScaleFactor: 1, mobile: false });
 await page("Emulation.setFocusEmulationEnabled", { enabled: true });
 await page("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
@@ -385,6 +392,7 @@ async function type(selector, text) {
 }
 
 const field = (scenario, i) => `#${scenario.id} .field[data-index="${i}"]`;
+const highlighted = (scenario) => ev(`[...document.querySelectorAll("#${scenario.id} .prompt .p")].map((el) => el.textContent)`);
 const shownText = (scenario) => ev(`document.querySelector("#${scenario.id} .prompt").textContent`);
 
 // Состояние элементов управления сценария, как в cases.json: options — индекс, ввод и область; chips — отмеченные.
@@ -464,26 +472,29 @@ const scenarios = data.scenarios;
 const sectionIds = await ev(`[...document.querySelectorAll(".scenario")].map((s) => s.id)`);
 ok(show(sectionIds) === show(scenarios.map((s) => s.id)), "страница", `разделы ${show(sectionIds)} не совпадают со сценариями данных`);
 
-const isDefault = (param, state) => param.choices
-  ? show([...state.picked].sort()) === show(param.default === "all" ? [...param.choices].sort() : [])
-  : state.index === 0 && !state.input && !state.choice;
-const defaultStates = (scenario) => scenario.params.map((param) => param.choices
-  ? { picked: param.default === "all" ? [...param.choices] : [] }
-  : { index: 0, input: "", choice: "" });
+// Состояния по умолчанию берутся из данных страницы; что они совпадают с показанным в начале, проверяют начальный текст
+// и текст после сброса.
+const normal = (state) => state.picked ? { picked: [...state.picked].sort() } : { index: state.index, input: state.input || "", choice: state.choice || "" };
+const defaultStates = (scenario) => scenario.defaults.map(normal);
+const isDefault = (scenario, states) => show(states.map(normal)) === show(defaultStates(scenario));
+const fileName = async (scenario) => `${await ev(`document.querySelector("#${scenario.id} h2 .num").textContent`)}-${scenario.id}.md`;
 const typeable = (states) => states.every((s) => !/[\n\r]/.test(s.input ?? "")); // <input> не хранит переводы строк
 
 // Исходный HTML без выполнения скриптов: запасной вариант страницы без JS показывает тот же текст.
-const staticTexts = await ev(`fetch(location.href).then((r) => r.text()).then((html) => {
-  const doc = new DOMParser().parseFromString(html, "text/html");
+// Политика страницы запрещает fetch, поэтому разбирается тот же файл, который отдал сервер.
+const staticTexts = await ev(`(() => {
+  const doc = new DOMParser().parseFromString(${show(readText(pagePath))}, "text/html");
   return Object.fromEntries([...doc.querySelectorAll(".scenario")].map((s) => [s.id, s.querySelector(".prompt").textContent]));
-})`, { awaitPromise: true });
+})()`);
+const policy = await ev(`document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.content ?? ""`);
+ok(/default-src 'none'/.test(policy) && /script-src 'sha256-/.test(policy) && !/unsafe-/.test(policy), "страница", `нет политики CSP без небезопасных источников: ${show(policy)}`);
 
-let driven = 0, skipped = 0;
+let driven = 0, skipped = 0, areaChecks = 0;
 for (const scenario of scenarios) {
   const where = `${scenario.id}`;
   try {
     const own = cases.filter((c) => c.id === scenario.id);
-    const base = own.find((c) => c.states.length === scenario.params.length && c.states.every((s, i) => isDefault(scenario.params[i], s)));
+    const base = own.find((c) => c.states.length === scenario.params.length && isDefault(scenario, c.states));
     if (!ok(base, where, "в cases.json нет случая «все по умолчанию»")) continue;
     const expected = base.expected;
     const reset = scenario.params.length ? `#${scenario.id} [data-action="reset"]` : null;
@@ -494,9 +505,8 @@ for (const scenario of scenarios) {
     if (reset) ok(await ev(`document.querySelector(${show(reset)}).disabled`), where, "кнопка сброса не отключена при значениях по умолчанию");
     sameText(await copy(scenario), expected, where, "начальный текст в буфере");
     const file = await download(scenario);
-    const num = await ev(`document.querySelector("#${scenario.id} h2 .num").textContent`);
-    ok(file.name === `${num}-${scenario.id}.md`, where, `имя скачанного файла ${show(file.name)}, ожидалось ${show(`${num}-${scenario.id}.md`)}`);
-    ok(file.name === scenario.file, where, `имя скачанного файла ${show(file.name)} не совпадает с данными страницы ${show(scenario.file)}`);
+    const name = await fileName(scenario);
+    ok(file.name === name, where, `имя скачанного файла ${show(file.name)}, ожидалось ${show(name)}`);
     sameText(file.text, expected, where, "скачанный текст при значениях по умолчанию");
 
     // Все случаи, которые можно воспроизвести вводом: смена вариантов, ввод, область, чипы, сочетания.
@@ -507,6 +517,10 @@ for (const scenario of scenarios) {
       const label = `${where} ${show(item.states).slice(0, 160)}`;
       const shown = await shownText(scenario);
       sameText(shown, item.expected, label, "текст на странице");
+      // Подсвечены ровно строки параметров, подряд, в порядке параметров.
+      const marked = await highlighted(scenario);
+      ok(marked.length === scenario.params.length && marked.every((line, k) => line.startsWith(`- ${scenario.params[k].key}: `)) &&
+        (!marked.length || shown.includes(marked.join("\n"))), label, `подсвечены не строки параметров: ${show(marked).slice(0, 200)}`);
       if (!item.expected.includes(data.missing)) sameText(await copy(scenario), item.expected, label, "текст в буфере");
     }
 
@@ -555,7 +569,7 @@ for (const scenario of scenarios) {
       scenario.params.forEach((param, i) => {
         const now = controls[i];
         if (param.choices) {
-          ok(show([...now.picked].sort()) === show(param.default === "all" ? [...param.choices].sort() : []), where,
+          ok(show(normal(now)) === show(defaultStates(scenario)[i]), where,
             `чипы «${param.key}» после сброса: отмечено ${show(now.picked)}`);
         } else {
           ok(now.index === 0 && now.input === "", where, `параметр «${param.key}» после сброса: ${show(now)}`);
@@ -577,6 +591,25 @@ for (const scenario of scenarios) {
       }
     }
 
+    // Область запоминается: вариант с выбором области, ввод, вторая область, вариант без области и снова первый вариант —
+    // область прежняя.
+    for (const [i, param] of scenario.params.entries()) {
+      const index = param.option?.findIndex((o) => o.choice?.length > 1) ?? -1;
+      const other = param.option?.findIndex((o, k) => k !== index && !o.choice) ?? -1;
+      if (index < 0 || other < 0) continue;
+      const label = `${where} параметр «${param.key}»`;
+      const area = param.option[index].choice[1];
+      await choose(scenario, i, index);
+      if (param.option[index].input !== undefined) await type(`${field(scenario, i)} .extra-input`, "значение");
+      await click(`${field(scenario, i)} .extra-choice .seg:nth-child(2)`);
+      await choose(scenario, i, other);
+      await choose(scenario, i, index);
+      const kept = (await readControls(scenario))[i];
+      areaChecks += 1;
+      ok(kept.choice === area, label, `область после перехода в другой вариант и обратно: ${show(kept.choice)}, ожидалось ${show(area)}`);
+      await click(reset);
+    }
+
     // Копирование и скачивание при измененных значениях: ровно показанный текст.
     const contrast = own.filter((c) => typeable(c.states)).at(-1);
     await applyStates(scenario, contrast.states);
@@ -585,14 +618,18 @@ for (const scenario of scenarios) {
       sameText(await copy(scenario), shownNow, where, "в буфере не тот текст, что показан");
       const changed = await download(scenario);
       sameText(changed.text, shownNow, where, "в скачанном файле не тот текст, что показан");
-      ok(changed.name === scenario.file, where, `имя файла ${show(changed.name)} при измененных значениях, ожидалось ${show(scenario.file)}`);
+      ok(changed.name === await fileName(scenario), where, `имя файла ${show(changed.name)} при измененных значениях, ожидалось ${show(await fileName(scenario))}`);
     }
   } catch (error) {
     fault(where, `тест прерван: ${error.message}`);
   }
 }
+ok(areaChecks > 0, "область", "не проверено сохранение области при смене варианта");
 ok(driven > 0, "случаи", "не воспроизведено ни одного случая из cases.json");
 
+ok(externalRequests.length === 0, "сеть", `внешние запросы со страницы:\n    ${externalRequests.join("\n    ")}`);
+const violations = await ev("window.__violations");
+ok(violations.length === 0, "CSP", `нарушения политики страницы:\n    ${violations.join("\n    ")}`);
 ok(pageErrors.length === 0, "консоль", `ошибки на странице:\n    ${pageErrors.join("\n    ")}`);
 
 const seconds = ((Date.now() - started) / 1000).toFixed(1);

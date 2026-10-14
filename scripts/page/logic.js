@@ -1,6 +1,6 @@
 // Сборка текста промпта: та же логика, что param_text и assemble в scripts/build.py.
 // CI сверяет их (scripts/parity.mjs): каждый вариант каждого параметра при остальных по умолчанию, сочетания
-// параметров и ввод с разными пробельными символами.
+// параметров и ввод с разными пробельными символами. Страница и сверка берут модель одной функцией model.
 var playbook = (() => {
   // Пробельные символы те же, что в WHITESPACE в build.py: сборка подставляет их на место метки.
   const spaces = /[@WHITESPACE@]+/g;
@@ -20,9 +20,24 @@ var playbook = (() => {
     if (option.choice) text = put(text, "{choice}", state.choice || option.choice[0]);
     return text;
   }
+  // Модель сценария: данные страницы и текст по умолчанию (его показывает <pre> без JS). Текст до и после раздела
+  // параметров берется из него, поэтому в данных его нет; at — номер строки заголовка раздела, строки параметров
+  // идут сразу за ним (по одной на параметр), first — номер первой из них.
+  function model(scenario, text) {
+    const { params, defaults, at } = scenario;
+    if (!params.length) return { params, defaults, before: text, after: "", first: 0 };
+    const lines = text.split("\n");
+    const end = at + 1 + params.length;
+    return {
+      params, defaults, first: at + 1,
+      before: lines.slice(0, at).join("\n") + (at ? "\n" : ""),
+      after: end < lines.length ? "\n" + lines.slice(end).join("\n") : ""
+    };
+  }
+  // text — весь промпт, lines — строки параметров, они занимают в тексте строки с номерами first и далее.
   function compose(model, states, missing) {
     const lines = model.params.map((param, i) => "- " + param.key + ": " + paramText(param, states[i], missing));
-    return { lines, text: model.before + (lines.length ? "## Параметры\n" + lines.join("\n") : "") + model.after };
+    return { lines, first: model.first, text: model.before + (lines.length ? "## Параметры\n" + lines.join("\n") : "") + model.after };
   }
-  return { clean, compose };
+  return { clean, model, compose };
 })();

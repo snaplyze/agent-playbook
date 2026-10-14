@@ -18,7 +18,9 @@ if sys.version_info < (3, 11):  # до импорта: tomllib появился 
     sys.exit(f"build: нужен Python 3.11 или новее (модуль tomllib), запущен {sys.version.split()[0]}")
 
 import argparse
+import base64
 import functools
+import hashlib
 import html
 import itertools
 import json
@@ -129,6 +131,12 @@ def string_list(table, key, where):
     return values
 
 
+def single_line(where, key, *values):
+    """Строка параметра в промпте — одна строка: страница находит раздел параметров и подсвечивает строки по номерам."""
+    if any("\n" in value for value in values):
+        fail(f"{where}: поле «{key}» не должно содержать перевод строки")
+
+
 def table_list(parent, key, where):
     items = parent.get(key, [])
     if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
@@ -147,7 +155,8 @@ def validate_param(where, param):
         if param.get("default") not in ("all", "none"):
             fail(f"{where}: поле «default» должно быть «all» или «none»")
         for key in ("all", "none", "some"):
-            string_field(param, key, where)
+            single_line(where, key, string_field(param, key, where))
+        single_line(where, "choices", *param["choices"])
         return
     options = table_list(param, "option", where)
     if not options:
@@ -158,12 +167,13 @@ def validate_param(where, param):
         check_keys(option, OPTION_KEYS, place)
         string_field(option, "label", place)
         line = string_field(option, "line", place)
+        single_line(place, "line", line)
         if "input" in option:
             string_field(option, "input", place)
             if number == 1:
                 fail(f"{place}: первый вариант — значение по умолчанию, он не может требовать ввода")
         if "choice" in option:
-            string_list(option, "choice", place)
+            single_line(place, "choice", *string_list(option, "choice", place))
         if ("{input}" in line) != ("input" in option):
             fail(f"{place}: {{input}} и поле input должны быть вместе")
         if ("{choice}" in line) != ("choice" in option):
@@ -208,7 +218,7 @@ def load():
         for position, param in enumerate(params, 1):
             key = param.get("key")
             place = f"{where}, параметр «{key}»" if isinstance(key, str) else f"{where}, параметр №{position}"
-            string_field(param, "key", place)
+            single_line(place, "key", string_field(param, "key", place))
             if key in keys:
                 fail(f"{place}: имя параметра повторяется")
             keys.append(key)
@@ -232,6 +242,8 @@ def load():
         for token in (PARAMS, RULES):
             if source.count(token) != 1:
                 fail(f"src/scenarios/{scenario['file']}: {token} должен встречаться ровно один раз")
+        if not re.search(f"^{re.escape(PARAMS)}$", source, re.M):
+            fail(f"src/scenarios/{scenario['file']}: {PARAMS} должен стоять отдельной строкой")
         scenario.update(source=source, text=source.replace(RULES, rules.strip()))
     return scenarios, rules
 
@@ -668,17 +680,17 @@ def inline(text):
 def param_field(scenario, index, param):
     fid = html.escape(f"{scenario['id']}-{index}")
     esc = html.escape
+    state = default_state(param)  # начальная разметка показывает то же, что вернет сброс на странице
     help_html = f'<p class="help" id="{fid}-help">{inline(param["help"])}</p>'
     if "choices" in param:
-        checked = " checked" if param["default"] == "all" else ""
-        chips = "".join(f'<label class="chip"><input type="checkbox" value="{esc(c)}"{checked}>'
+        chips = "".join(f'<label class="chip"><input type="checkbox" value="{esc(c)}"{" checked" if c in state["picked"] else ""}>'
                         f'<span class="chip-box" aria-hidden="true">{ICON["check"]}</span><span>{esc(c)}</span></label>'
                         for c in param["choices"])
         return (f'<div class="field wide" data-index="{index}" role="group" aria-labelledby="{fid}-label" '
                 f'aria-describedby="{fid}-help"><span class="label" id="{fid}-label">{esc(param["key"])}</span>'
                 f'<div class="chips">{chips}</div>{help_html}</div>')
     options = "".join(
-        f'<li class="option" role="option" id="{fid}-o{i}" data-value="{i}" aria-selected="{"true" if i == 0 else "false"}">'
+        f'<li class="option" role="option" id="{fid}-o{i}" data-value="{i}" aria-selected="{"true" if i == state["index"] else "false"}">'
         f'<span>{esc(o["label"])}</span>{ICON["check"]}</li>' for i, o in enumerate(param["option"]))
     extra = ""
     if any("input" in o for o in param["option"]):
@@ -692,7 +704,7 @@ def param_field(scenario, index, param):
     return (f'<div class="field" data-index="{index}"><label class="label" id="{fid}-label" for="{fid}">{esc(param["key"])}</label>'
             f'<div class="select"><button type="button" class="select-trigger" id="{fid}" role="combobox" '
             f'aria-haspopup="listbox" aria-expanded="false" aria-controls="{fid}-list" aria-describedby="{fid}-help" '
-            f'popovertarget="{fid}-pop" data-value="0"><span class="select-value">{esc(param["option"][0]["label"])}</span>'
+            f'popovertarget="{fid}-pop" data-value="{state["index"]}"><span class="select-value">{esc(param["option"][state["index"]]["label"])}</span>'
             f'{ICON["chevron"]}</button><div class="listbox-pop" id="{fid}-pop" popover>'
             f'<p class="listbox-title" aria-hidden="true">{esc(param["key"])}</p>'
             f'<ul class="listbox" id="{fid}-list" role="listbox" aria-labelledby="{fid}-label">{options}</ul></div></div>'
@@ -720,7 +732,8 @@ def scenario_section(scenario, built):
     <button type="button" class="btn btn-secondary" data-action="download"><span class="btn-icons">{ICON["download"]}{ICON["check"]}</span><span class="btn-label">Скачать .md</span></button>
     <span class="meta"></span>
   </div>
-  <pre class="prompt" tabindex="0" aria-label="Текст промпта">{html.escape(built, quote=False)}</pre>
+  <pre class="prompt" tabindex="0" aria-label="Текст промпта">
+{html.escape(built, quote=False)}</pre>
 </section>"""
 
 
@@ -744,18 +757,72 @@ def fill(text, values, where):
     return MARK.sub(put, text)
 
 
+PAGE_PARAM_KEYS = ("key", "choices", "none", "all", "some", "option")  # поля параметра, которые читает страница
+
+
+def page_scenario(scenario):
+    """Данные сценария для страницы. Текста промпта в них нет: страница берет его из <pre> и по at (номер строки
+    заголовка раздела параметров) находит место параметров; defaults — состояния по умолчанию, их же показывает разметка."""
+    data = {"id": scenario["id"]}
+    if scenario["params"]:
+        data["at"] = split(scenario)[0].count("\n")
+    data["defaults"] = [default_state(param) for param in scenario["params"]]
+    data["params"] = [{key: param[key] for key in PAGE_PARAM_KEYS if key in param} for param in scenario["params"]]
+    return data
+
+
+# Палитры в page.css: светлая в :root, темная записана дважды (системная тема и выбор вручную).
+LIGHT_PALETTE = re.compile(r"^:root \{\n(.*?)\n\}", re.S | re.M)
+DARK_PALETTES = re.compile(r':root(?::not\(\[data-theme="light"\]\)|\[data-theme="dark"\]) \{\n(.*?)\n\s*\}', re.S)
+PAPER = re.compile(r"--paper:\s*(#[0-9A-Fa-f]{6})\s*;")
+
+
+def theme_colors(css):
+    """Цвета theme-color (фон страницы --paper) для светлой и темной темы из page.css; две копии темной палитры
+    должны совпадать."""
+    light, dark = LIGHT_PALETTE.search(css), DARK_PALETTES.findall(css)
+    if not light or len(dark) != 2:
+        fail("page.css: ожидались светлая палитра в :root и два блока темной (системная тема и data-theme=\"dark\")")
+    lines = [[line.strip() for line in body.splitlines()] for body in dark]
+    if lines[0] != lines[1]:
+        fail("page.css: два блока темной палитры расходятся; правь их парно")
+    colors = [PAPER.search(body) for body in (light[1], dark[0])]
+    if not all(colors):
+        fail("page.css: в палитре нет --paper: #RRGGBB")
+    return colors[0][1], colors[1][1]
+
+
+def content_security_policy(page):
+    """Политика для <meta>: хеш sha256 каждого встроенного исполняемого скрипта и стиля по итоговому тексту страницы;
+    скрипт с src и скрипты других типов, кроме данных JSON, не поддерживаются."""
+    hashes = {"script": [], "style": []}
+    for tag, attrs, code in re.findall(r"<(script|style)\b([^>]*)>(.*?)</\1>", page, re.S | re.I):
+        if tag == "script" and 'type="application/json"' in attrs:
+            continue
+        if re.search(r"\b(?:src|type)\s*=", attrs):
+            fail(f"page.html: <{tag}{attrs}> не поддерживается политикой: нужен встроенный {tag} без src и type")
+        digest = base64.b64encode(hashlib.sha256(code.encode()).digest()).decode()
+        hashes[tag].append(f"'sha256-{digest}'")
+    parts = ["default-src 'none'"]
+    parts += [f"{tag}-src {' '.join(items)}" for tag, items in hashes.items() if items]
+    return "; ".join(parts + ["img-src data:", "base-uri 'none'", "form-action 'none'"])
+
+
 def render_site(scenarios, built):
     """Текст страницы из scripts/page/ и сценариев; ошибка шаблона (неизвестная метка и т. п.) — fail."""
-    data = [{"id": s["id"], "file": s["file"], "before": split(s)[0], "after": split(s)[1], "params": s["params"]}
-            for s in scenarios]
+    data = [page_scenario(s) for s in scenarios]
     rail = "".join(f'<li><a href="#{html.escape(s["id"])}" data-id="{html.escape(s["id"])}">'
                    f'<span class="num">{html.escape(s["num"])}</span><span class="name">{html.escape(s["name"])}</span></a></li>'
                    for s in scenarios)
     sha = html.escape(os.environ.get("GITHUB_SHA", "")[:7])
     built_from = f' Собрано из коммита <a href="https://github.com/{html.escape(REPO)}/commit/{sha}">{sha}</a>.' if sha else ""
     source = page_source()
+    css = fill(source["page.css"], {}, "page.css")
+    paper_light, paper_dark = theme_colors(css)
     page = fill(source["page.html"], {
-        "STYLE": fill(source["page.css"], {}, "page.css"),
+        "STYLE": css,
+        "PAPER_LIGHT": paper_light, "PAPER_DARK": paper_dark,
+        "CSP": "@CSP@",  # место политики: хеши считаются по готовой странице, ниже метка заменяется ею
         "LOGIC": fill(source["logic.js"], {"WHITESPACE": WHITESPACE}, "logic.js"),
         "APP": fill(source["app.js"], {}, "app.js"),
         "RAIL": rail,
@@ -764,12 +831,14 @@ def render_site(scenarios, built):
         "ICON_AUTO": ICON["auto"], "ICON_SUN": ICON["sun"], "ICON_MOON": ICON["moon"],
         "REPO": html.escape(REPO), "BUILT": built_from,
     }, "page.html")
-    return page
+    if page.count("@CSP@") != 1:
+        fail("page.html: метка @CSP@ должна встречаться в странице ровно один раз")
+    return page.replace("@CSP@", html.escape(content_security_policy(page)))
 
 
 def build_site(page, out):
     out.mkdir(parents=True, exist_ok=True)
-    (out / "index.html").write_text(page, encoding="utf-8")
+    (out / "index.html").write_text(page, encoding="utf-8", newline="\n")
     print(f"{out / 'index.html'}: {len(page.encode())} байт")
 
 
@@ -799,13 +868,13 @@ def main():
         for stale in set(PROMPTS.glob("*.md")) - {PROMPTS / s["file"] for s in scenarios}:
             stale.unlink()
         for s, text in zip(scenarios, built):
-            (PROMPTS / s["file"]).write_text(text, encoding="utf-8")
-        README.write_text(readme, encoding="utf-8")
+            (PROMPTS / s["file"]).write_text(text, encoding="utf-8", newline="\n")
+        README.write_text(readme, encoding="utf-8", newline="\n")
         print(f"собрано: {len(built)} промптов, таблицы README")
     if args.site:
         build_site(page, args.site)
     if args.parity_cases:
-        args.parity_cases.write_text(json.dumps(parity_cases(variants), ensure_ascii=False), encoding="utf-8")
+        args.parity_cases.write_text(json.dumps(parity_cases(variants), ensure_ascii=False), encoding="utf-8", newline="\n")
         print(f"{args.parity_cases}: случаев {len(variants)}")
 
 
