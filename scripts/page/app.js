@@ -2,7 +2,7 @@
   const root = document.documentElement;
   root.classList.add("js");
   const { scenarios: data, missing } = JSON.parse(document.getElementById("data").textContent);
-  const { clean, compose } = playbook;
+  const { clean, model: modelOf, compose } = playbook;
   const reduced = matchMedia("(prefers-reduced-motion: reduce)");
   const narrow = matchMedia("(max-width: 640px)");
   const coarse = matchMedia("(pointer: coarse)");
@@ -13,12 +13,13 @@
   const count = (n) => n.toLocaleString("ru-RU") + " " + plural(n);
   const replay = (el, cls) => { el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); };
 
-  // --- Тема: системная, светлая или тёмная; выбор хранится в localStorage.
+  // --- Тема: системная, светлая или тёмная; выбор хранится в localStorage. Цвет theme-color — фон страницы
+  // (--paper) выбранной темы: единственный источник цветов — CSS.
   const themeButtons = [...document.querySelectorAll("[data-theme-set]")];
   function applyTheme(value) {
     if (value) root.dataset.theme = value; else delete root.dataset.theme;
-    const dark = value === "dark" || (!value && matchMedia("(prefers-color-scheme: dark)").matches);
-    document.querySelectorAll('meta[name="theme-color"]').forEach((m) => m.setAttribute("content", dark ? "#0E1117" : "#EDF0F4"));
+    const paper = getComputedStyle(root).getPropertyValue("--paper").trim();
+    document.querySelectorAll('meta[name="theme-color"]').forEach((m) => m.setAttribute("content", paper));
     themeButtons.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.themeSet === (value || ""))));
   }
   themeButtons.forEach((b) => b.addEventListener("click", () => {
@@ -69,14 +70,19 @@
       pop.classList.toggle("sheet", sheet);
       pop.style.cssText = "";
       if (sheet) return;
+      // Размеры списка задает CSS: предел высоты (--list-max), высота пункта и рамка с отступами — для оценки
+      // высоты, пока список скрыт и scrollHeight равен нулю.
+      const css = getComputedStyle(pop);
+      const px = (value) => parseFloat(value);
+      const frame = px(css.paddingTop) + px(css.paddingBottom) + px(css.borderTopWidth) + px(css.borderBottomWidth);
       const r = trigger.getBoundingClientRect();
-      const need = Math.min(pop.scrollHeight || options.length * 42 + 14, 320);
+      const need = Math.min(pop.scrollHeight || options.length * px(getComputedStyle(options[0]).minHeight) + frame, px(css.getPropertyValue("--list-max")));
       const below = innerHeight - r.bottom - 12, above = r.top - 12;
       const up = below < need && above > below;
       pop.dataset.side = up ? "top" : "bottom";
       pop.style.left = r.left + "px";
       pop.style.width = r.width + "px";
-      pop.style.maxHeight = Math.max(120, Math.min(320, up ? above : below)) + "px";
+      pop.style.setProperty("--space", (up ? above : below) + "px");
       if (up) pop.style.bottom = (innerHeight - r.top + 6) + "px"; else pop.style.top = (r.bottom + 6) + "px";
     }
     function setActive(i, scroll) {
@@ -199,26 +205,31 @@
   addEventListener("resize", moveIndicator);
   if (document.fonts) document.fonts.ready.then(moveIndicator);
 
-  function highlight(text, marked, changed) {
-    return text.split("\n").map((line) => {
+  // Подсветка: строки параметров — по их месту в тексте (range.first и далее, по одной на параметр).
+  function highlight(text, range, changed) {
+    return text.split("\n").map((line, n) => {
       let out = esc(line);
       if (/^#{1,6} /.test(line)) return '<span class="h">' + out + "</span>";
       out = out.replace(/^(\s*)(- |\d+\. )/, '$1<span class="m">$2</span>');
       out = out.replace(/`([^`]+)`/g, '<span class="c">`$1`</span>');
       out = out.replace(/\*\*(.+?)\*\*/g, '<span class="b">**$1**</span>');
-      if (marked.has(line)) out = '<span class="p' + (changed.has(line) ? " changed" : "") + '">' + out + "</span>";
+      const param = n - range.first;
+      if (param >= 0 && param < range.count) out = '<span class="p' + (changed.includes(param) ? " changed" : "") + '">' + out + "</span>";
       return out;
     }).join("\n");
   }
 
   sections.forEach((section) => {
-    const model = data.find((item) => item.id === section.id);
     const pre = section.querySelector(".prompt");
+    // Текст по умолчанию — то, что собрала сборка и показывает <pre> до первой отрисовки.
+    const defaultText = pre.textContent;
+    const model = modelOf(data.find((item) => item.id === section.id), defaultText);
     const meta = section.querySelector(".meta");
     const bar = section.querySelector(".bar");
     const resetButton = section.querySelector('[data-action="reset"]');
     const fields = [...section.querySelectorAll(".field[data-index]")];
     const selects = new Map();
+    const touched = new Set(); // поля, у которых пустое значение уже показано подсказкой
     let text = "", previous = null;
 
     if ("IntersectionObserver" in window) {
@@ -229,67 +240,74 @@
       const param = model.params[field.dataset.index];
       if (param.choices) return;
       selects.set(field, makeSelect(field, param, () => {
+        // Другой вариант — другая область: выбор области начинается с умолчания.
+        sync(field, { ...read(field), choice: "" });
         render();
         const input = field.querySelector(".extra-input:not([hidden])");
         if (input && !clean(input.value)) input.focus();
       }));
     });
 
-    // Состояние элементов управления: видимость поля значения и второго выбора.
-    function state(field) {
+    // Чтение состояния элементов управления, как в model.defaults и в states у compose; DOM не меняет.
+    function read(field) {
       const param = model.params[field.dataset.index];
       if (param.choices) return { picked: [...field.querySelectorAll("input:checked")].map((input) => input.value) };
-      const index = selects.get(field).value();
-      const option = param.option[index];
+      const input = field.querySelector(".extra-input");
+      const choice = field.querySelector(".extra-choice");
+      const radio = choice && !choice.hidden && choice.querySelector("input:checked");
+      return { index: selects.get(field).value(), input: input ? input.value : "", choice: radio ? radio.value : "" };
+    }
+    // Синхронизация: приводит элементы управления и то, что из них следует (видимость поля значения и области,
+    // подсказка, aria-invalid), к состоянию. Повторный вызов с тем же состоянием ничего не меняет.
+    function sync(field, state) {
+      const param = model.params[field.dataset.index];
+      if (param.choices) {
+        field.querySelectorAll("input").forEach((input) => { input.checked = state.picked.includes(input.value); });
+        return;
+      }
+      selects.get(field).set(state.index);
+      const option = param.option[state.index];
       const input = field.querySelector(".extra-input");
       const choice = field.querySelector(".extra-choice");
       const extra = field.querySelector(".extra");
       if (input) {
+        const value = state.input || "";
         const need = option.input !== undefined;
-        const empty = need && !clean(input.value);
+        const empty = need && !clean(value);
+        if (input.value !== value) input.value = value;
         input.hidden = !need;
         input.placeholder = option.input || "";
         input.setAttribute("aria-invalid", String(empty));
-        field.querySelector(".note").hidden = !(empty && field.dataset.touched);
+        field.querySelector(".note").hidden = !(empty && touched.has(field));
       }
       if (choice) {
         choice.hidden = !option.choice;
-        if (option.choice && choice.dataset.for !== String(index)) {
-          choice.innerHTML = option.choice.map((value, i) => '<label class="seg"><input type="radio" name="' + field.querySelector(".select-trigger").id +
-            '-choice" value="' + esc(value) + '"' + (i ? "" : " checked") + "><span>" + esc(value) + "</span></label>").join("");
-          choice.dataset.for = String(index);
+        if (option.choice) {
+          const built = [...choice.querySelectorAll("input")].map((radio) => radio.value);
+          if (built.length !== option.choice.length || built.some((value, i) => value !== option.choice[i])) {
+            choice.innerHTML = option.choice.map((value) => '<label class="seg"><input type="radio" name="' + field.querySelector(".select-trigger").id +
+              '-choice" value="' + esc(value) + '"><span>' + esc(value) + "</span></label>").join("");
+          }
+          choice.querySelectorAll("input").forEach((radio) => { radio.checked = radio.value === (state.choice || option.choice[0]); });
         }
       }
       if (extra) extra.dataset.open = String(Boolean(input && !input.hidden || choice && !choice.hidden));
-      return { index, input: input ? input.value : "", choice: choice && !choice.hidden ? choice.querySelector("input:checked").value : "" };
-    }
-    function isDefault() {
-      return fields.every((field) => {
-        const param = model.params[field.dataset.index];
-        if (param.choices) {
-          const picked = [...field.querySelectorAll("input:checked")].map((input) => input.value);
-          const wanted = param.default === "all" ? param.choices : [];
-          return picked.length === wanted.length && picked.every((value, i) => value === wanted[i]);
-        }
-        const input = field.querySelector(".extra-input");
-        return selects.get(field).value() === 0 && !(input && input.value);
-      });
     }
     function render() {
-      const result = compose(model, fields.map(state), missing);
+      const states = fields.map(read);
+      fields.forEach((field, i) => sync(field, states[i]));
+      const result = compose(model, states, missing);
       const lines = result.lines;
       text = result.text;
-      const marked = new Set(lines);
-      const changedIndexes = previous ? lines.map((line, i) => previous.has(line) ? -1 : i).filter((i) => i >= 0) : [];
-      const changed = new Set(changedIndexes.map((i) => lines[i]));
-      previous = marked;
-      pre.innerHTML = highlight(text, marked, changed);
+      const changed = previous ? lines.map((line, i) => line !== previous[i] ? i : -1).filter((i) => i >= 0) : [];
+      previous = lines;
+      pre.innerHTML = highlight(text, { first: result.first, count: lines.length }, changed);
       meta.textContent = count(text.length);
-      changedIndexes.forEach((i) => replay(fields[i], "is-pulse"));
-      if (resetButton) resetButton.disabled = isDefault();
+      changed.forEach((i) => replay(fields[i], "is-pulse"));
+      if (resetButton) resetButton.disabled = text === defaultText;
     }
     section.addEventListener("input", (event) => {
-      if (event.target.matches(".extra-input")) event.target.closest(".field").dataset.touched = "true";
+      if (event.target.matches(".extra-input")) touched.add(event.target.closest(".field"));
       render();
     });
     fields.forEach((field) => field.addEventListener("animationend", (e) => { if (e.animationName === "label-pulse") field.classList.remove("is-pulse"); }));
@@ -300,7 +318,7 @@
       const input = [...section.querySelectorAll(".extra-input:not([hidden])")].find((candidate) => !clean(candidate.value));
       if (!input) return false;
       const field = input.closest(".field");
-      field.dataset.touched = "true";
+      touched.add(field);
       render();
       replay(input, "is-shake");
       toast("warn", "Заполните поле «" + field.querySelector(".label").textContent + "»");
@@ -341,18 +359,8 @@
       done(event.currentTarget, "Скачано", "ok", "Файл " + section.dataset.file + " скачан");
     });
     if (resetButton) resetButton.addEventListener("click", () => {
-      fields.forEach((field) => {
-        const param = model.params[field.dataset.index];
-        if (param.choices) field.querySelectorAll("input").forEach((input) => { input.checked = param.default === "all"; });
-        else {
-          selects.get(field).set(0);
-          const input = field.querySelector(".extra-input");
-          const choice = field.querySelector(".extra-choice");
-          if (input) input.value = "";
-          if (choice) delete choice.dataset.for;
-          delete field.dataset.touched;
-        }
-      });
+      touched.clear();
+      fields.forEach((field, i) => sync(field, model.defaults[i]));
       render();
       toast("ok", "Параметры сброшены");
     });

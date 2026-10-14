@@ -1,9 +1,11 @@
-// Сверка страницы со сборкой: все встроенные скрипты страницы компилируются, а логика сборки текста даёт тот же
-// текст, что build.py. Запуск, как в CI (<tmp> — каталог вне репозитория):
+// Сверка страницы со сборкой: все встроенные скрипты страницы компилируются и перечислены в политике CSP по хешу, а
+// логика сборки текста даёт тот же текст, что build.py. Модель сценария строится так же, как на странице: из данных
+// и текста <pre>. Запуск, как в CI (<tmp> — каталог вне репозитория):
 //   python3 scripts/build.py --check --site <tmp>/site --parity-cases <tmp>/cases.json
 //   node scripts/parity.mjs <tmp>/site/index.html <tmp>/cases.json
 // Случаи: все параметры по умолчанию; каждый вариант каждого параметра при остальных по умолчанию (с вводом,
 // в том числе с разными пробельными символами); полный перебор сочетаний, где их мало; все параметры не по умолчанию.
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 
@@ -51,6 +53,21 @@ for (const script of executable) {
 }
 if (broken.length) die(broken.join("\n"));
 
+// Политика CSP: каждый встроенный исполняемый скрипт и стиль указан хешем, небезопасных источников нет.
+const policy = page.match(/<meta http-equiv="Content-Security-Policy" content="([^"]*)">/)?.[1]
+  .replaceAll("&#x27;", "'").replaceAll("&amp;", "&") ?? die(`${pagePath}: нет <meta http-equiv="Content-Security-Policy">`);
+const sources = (directive) => policy.split(";").map((part) => part.trim().split(/\s+/)).find(([name]) => name === directive)?.slice(1) ?? [];
+if (/unsafe-/.test(policy)) die(`CSP разрешает небезопасное: ${policy}`);
+const hash = (code) => `'sha256-${createHash("sha256").update(code).digest("base64")}'`;
+for (const script of executable) {
+  if (!sources("script-src").includes(hash(script.code))) die(`CSP: хеша ${script.label} нет в script-src: ${policy}`);
+}
+for (const [, code] of page.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/gi)) {
+  if (!sources("style-src").includes(hash(code))) die(`CSP: хеша <style> нет в style-src: ${policy}`);
+}
+if (sources("script-src").length !== executable.length) die(`CSP: в script-src ${sources("script-src").length} хешей, скриптов ${executable.length}`);
+if (sources("default-src").join() !== "'none'") die(`CSP: default-src должен быть 'none': ${policy}`);
+
 const logic = scripts.find((s) => s.id === "logic")?.code ?? die(`${pagePath}: нет скрипта <script id="logic">`);
 const dataText = scripts.find((s) => s.id === "data")?.code ?? die(`${pagePath}: нет данных <script id="data">`);
 let data;
@@ -65,10 +82,17 @@ try {
 } catch (error) {
   die(`${casesPath}: не разбирается как JSON: ${error.message}`);
 }
-const { compose } = vm.runInNewContext(`${logic}\nplaybook`, {}, { filename: "<script id=\"logic\">" });
+const { model: modelOf, compose } = vm.runInNewContext(`${logic}\nplaybook`, {}, { filename: "<script id=\"logic\">" });
 
-// Пустой или неполный набор случаев сверкой не считается.
-const models = new Map(data.scenarios.map((scenario) => [scenario.id, scenario]));
+// Текст по умолчанию каждого сценария — содержимое его <pre>, как его читает страница (textContent). В разметке
+// экранированы только <, > и &; любая другая сущность значила бы, что разбор здесь разошелся с браузером.
+const unescape = (text) => text.replace(/&(lt|gt|amp);|&[#\w]+;/g, (entity, name) => ({ lt: "<", gt: ">", amp: "&" })[name] ?? die(`<pre>: неожиданная сущность ${entity}`));
+const texts = new Map([...page.matchAll(/<section class="scenario" id="([^"]+)"[\s\S]*?<pre class="prompt"[^>]*>([\s\S]*?)<\/pre>/g)]
+  .map(([, id, text]) => [id, unescape(text)]));
+const models = new Map(data.scenarios.map((scenario) => {
+  const text = texts.get(scenario.id) ?? die(`${pagePath}: у сценария ${scenario.id} нет <pre> с текстом`);
+  return [scenario.id, { model: modelOf(scenario, text), text }];
+}));
 if (!models.size) die(`${pagePath}: на странице нет сценариев`);
 if (!Array.isArray(cases) || !cases.length) die(`${casesPath}: нет ни одного случая`);
 const perScenario = new Map();
@@ -90,14 +114,27 @@ function firstDifference(a, b) {
 
 const around = (text, at) => JSON.stringify(text.slice(Math.max(0, at - 30), at + 50));
 let failed = 0;
+let defaultsFailed = 0;
+// Состояния по умолчанию из данных дают текст, который страница показывает без JS.
+for (const [id, { model, text }] of models) {
+  let built;
+  try {
+    ({ text: built } = compose(model, model.defaults, data.missing));
+  } catch (error) {
+    built = `<ошибка: ${error.message}>`;
+  }
+  if (built !== text) {
+    defaultsFailed += 1;
+    const at = firstDifference(built, text);
+    console.error(`${id}: состояния по умолчанию из данных дают другой текст, чем <pre> (с позиции ${at}):\n  данные: ${around(built, at)}\n  <pre>:  ${around(text, at)}`);
+  }
+}
 for (const { id, states, expected } of cases) {
-  const model = models.get(id);
-  const full = model.params.map((param, i) => states[i] ?? (param.choices
-    ? { picked: param.default === "all" ? [...param.choices] : [] }
-    : { index: 0 }));
+  const { model } = models.get(id);
+  if (states.length !== model.params.length) die(`${casesPath}: у случая ${id} ${states.length} состояний, параметров ${model.params.length}`);
   let text;
   try {
-    ({ text } = compose(model, full, data.missing));
+    ({ text } = compose(model, states, data.missing));
   } catch (error) {
     text = `<ошибка: ${error.message}>`;
   }
@@ -110,5 +147,5 @@ for (const { id, states, expected } of cases) {
   }
 }
 if (failed > SHOWN) console.error(`... и еще ${failed - SHOWN} расхождений`);
-console.log(`сверка страницы с build.py: ${cases.length - failed}/${cases.length} совпадают; скриптов проверено: ${executable.length}; сценариев: ${models.size}`);
-process.exit(failed ? 1 : 0);
+console.log(`сверка страницы с build.py: ${cases.length - failed}/${cases.length} совпадают (и ${models.size} текстов по умолчанию); скриптов проверено: ${executable.length}; сценариев: ${models.size}`);
+process.exit(failed || defaultsFailed ? 1 : 0);
