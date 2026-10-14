@@ -25,7 +25,7 @@
 // Windows: системный буфер там хранит переводы строк как CRLF, поэтому текст из буфера приводится к LF (текст <pre> и
 // скачанный файл сравниваются как есть), а дерево процессов Chrome завершается через taskkill.
 import { spawn } from "node:child_process";
-import { accessSync, constants, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { accessSync, constants, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
@@ -494,8 +494,10 @@ async function download(scenario) {
   const before = downloads.length;
   await click(`#${scenario.id} [data-action="download"]`);
   const item = await waitFor(() => downloads.slice(before).find((d) => d.state === "completed"), "скачивание не завершилось");
-  const files = readdirSync(dir);
-  if (!(files.length === 1 && files[0] === item.suggestedFilename)) throw new Error(`в каталоге скачивания ${show(files)}, ожидался ${show(item.suggestedFilename)}`);
+  // Скачивания страницы считаются по событиям браузера, а не по каталогу: Chrome на Windows иногда кладет туда
+  // свой служебный downloads.htm, который страница не скачивала.
+  const started = downloads.slice(before);
+  if (started.length !== 1) throw new Error(`скачиваний ${started.length}, ожидалось одно: ${show(started.map((d) => `${d.suggestedFilename} ← ${d.url}`))}`);
   return { name: item.suggestedFilename, text: readFileSync(join(dir, item.suggestedFilename), "utf8") };
 }
 
