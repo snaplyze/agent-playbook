@@ -89,7 +89,7 @@ python3 scripts/build.py --site _site   # собрать prompts/, таблиц�
 
 Нужны Python 3.11+ и, для сверки страницы, Node.js. Полная проверка, как в CI (`<tmp>` — каталог вне репозитория): `python3 scripts/build.py --check --site <tmp>/site --parity-cases <tmp>/cases.json`, затем `node scripts/parity.mjs <tmp>/site/index.html <tmp>/cases.json`.
 
-CI запускает проверку на каждый PR и push в `main` и сверяет страницу с `build.py` (`scripts/parity.mjs`) на каждом варианте каждого параметра при остальных по умолчанию; для множественного выбора — пустой, полный и два частичных набора. После слияния в `main` workflow `pages` публикует страницу на GitHub Pages.
+CI запускает проверку на каждый PR и push в `main` и сверяет страницу с `build.py` (`scripts/parity.mjs`) на каждом варианте каждого параметра при остальных по умолчанию; для множественного выбора — пустой, полный и два частичных набора. После слияния в `main` задание `deploy` публикует на GitHub Pages страницу, собранную и проверенную в том же прогоне.
 
 ## Лицензия
 
