@@ -25,7 +25,7 @@
 // Windows: системный буфер там хранит переводы строк как CRLF, поэтому текст из буфера приводится к LF (текст <pre> и
 // скачанный файл сравниваются как есть), а дерево процессов Chrome завершается через taskkill.
 import { spawn } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { accessSync, constants, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
@@ -182,14 +182,23 @@ async function launch(bin, extraFlags, profile) {
     child.on("exit", (code, signal) => { exited = { code, signal }; done(); });
     child.on("error", (error) => { exited = { code: null, signal: null, error }; done(); });
   });
+  // Очистка знает о Chrome сразу после запуска: сбой на старте тоже завершает его до удаления профиля.
+  cleanups.push(async () => {
+    await killTree(child);
+    await Promise.race([gone, sleep(5_000)]); // профиль удаляется только после выхода Chrome
+  });
   const portFile = join(profile, "DevToolsActivePort");
   const until = Date.now() + 20_000;
   while (Date.now() < until) {
     if (exited) break;
-    if (existsSync(portFile)) {
-      const [port, path] = readText(portFile).split("\n");
-      if (port && path) return { child, gone, wsUrl: `ws://127.0.0.1:${port}${path}` };
+    let text = "";
+    try {
+      text = readFileSync(portFile, "utf8");
+    } catch {
+      // Файла еще нет или Chrome его пишет (на Windows чтение дает EBUSY): ждем дальше.
     }
+    const [port, path] = text.split("\n");
+    if (port && path) return { child, gone, wsUrl: `ws://127.0.0.1:${port}${path}` };
     await sleep(40);
   }
   const early = Boolean(exited && !exited.error); // завершился сам, не успев открыть порт: признак отказа песочницы
@@ -311,10 +320,6 @@ if (launched.error) {
   console.error("smoke: Chrome с песочницей не стартовал, запущен с --no-sandbox");
   launched = retry;
 }
-cleanups.push(async () => {
-  await killTree(launched.child);
-  await Promise.race([launched.gone, sleep(5_000)]); // профиль удаляется только после выхода Chrome
-});
 
 const cdp = await Cdp.connect(launched.wsUrl);
 const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
