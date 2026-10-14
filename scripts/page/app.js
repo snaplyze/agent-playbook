@@ -349,9 +349,11 @@
         () => done(button, "Скопировано", "ok", "Промпт скопирован: " + count(text.length)),
         () => {
           // Конец выделения — начало следующего узла: иначе браузер не включает в копию завершающий перевод строки.
+          // Узел есть всегда: если разметка ничего не оставила после <pre>, это пустой текстовый узел.
+          if (!pre.nextSibling) pre.after(document.createTextNode(""));
           const range = document.createRange();
           range.setStart(pre, 0);
-          if (pre.nextSibling) range.setEnd(pre.nextSibling, 0); else range.setEndAfter(pre);
+          range.setEnd(pre.nextSibling, 0);
           getSelection().removeAllRanges();
           getSelection().addRange(range);
           done(button, "Выделено", "warn", "Буфер обмена недоступен. Текст выделен: нажмите Ctrl+C");

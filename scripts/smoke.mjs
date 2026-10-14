@@ -466,8 +466,21 @@ const setClipboard = (text) => ev(`navigator.clipboard.writeText(${show(text)})`
 
 async function copy(scenario) {
   await setClipboard(SENTINEL);
+  // Прежние выделение и уведомления не должны скрыть запасной путь, сработавший при успешной записи.
+  await ev(`getSelection().removeAllRanges(); document.querySelectorAll(".toast").forEach((t) => t.remove())`);
   await click(`#${scenario.id} [data-action="copy"]`);
-  return waitFor(async () => { const text = await clipboard(); return text !== SENTINEL && text; }, "буфер не изменился");
+  const text = await waitFor(async () => { const text = await clipboard(); return text !== SENTINEL && text; }, "буфер не изменился");
+  // Запись удалась: кнопка «Скопировано», выделения и подсказки про Ctrl+C нет (запасной путь молчит).
+  const after = await waitFor(() => ev(`(() => {
+    const label = document.querySelector("#${scenario.id} [data-action='copy'] .btn-label").textContent;
+    if (label === "Скопировать промпт") return null;
+    return { label, collapsed: getSelection().isCollapsed, hint: [...document.querySelectorAll(".toast.warn")].some((t) => t.textContent.includes("Ctrl+C")) };
+  })()`), "кнопка не показала результат копирования");
+  const where = `${scenario.id} копирование`;
+  ok(after.label === "Скопировано", where, `метка кнопки после успешной записи ${show(after.label)}`);
+  ok(after.collapsed, where, "после успешной записи текст выделен");
+  ok(!after.hint, where, "после успешной записи показана подсказка про Ctrl+C");
+  return text;
 }
 
 async function download(scenario) {
@@ -729,7 +742,25 @@ try {
     probe.remove();
     return result;
   })()`);
-  const notices = () => ev(`[...document.querySelectorAll(".toasts .toast.warn")].filter((t) => t.textContent.includes("длиннее")).length`);
+  // Объявления считаются событиями, а не по тостам в DOM: тост живет несколько секунд и переживает фазы теста.
+  await ev(`window.__notices = 0;
+    new MutationObserver((records) => records.forEach((r) => r.addedNodes.forEach((n) => {
+      if (n.classList?.contains("warn") && n.textContent.includes("длиннее")) window.__notices += 1;
+    }))).observe(document.querySelector(".toasts"), { childList: true })`);
+  const announced = async (phase, expected, action) => {
+    await ev(`window.__notices = 0`);
+    await action();
+    const got = await ev(`window.__notices`);
+    ok(got === expected, `${where} ${phase}`, `объявлений о превышении ${got}, ожидалось ${expected} (одно при каждом пересечении предела, без повтора на каждый символ)`);
+  };
+  const exceed = async (extra) => {
+    await type(input, "а".repeat(limit + 100 + extra));
+    return waitFor(async () => { const c = await counter(); return c.over && c; }, "пометка о превышении предела не появилась");
+  };
+  const within = async () => {
+    await type(input, "а");
+    return waitFor(async () => { const c = await counter(); return !c.over && c; }, "пометка осталась при тексте в пределах");
+  };
   const digits = (text) => text.replace(/\D/g, "");
 
   await openScenario(scenario);
@@ -738,12 +769,12 @@ try {
   await choose(scenario, i, index);
   for (const scheme of ["light", "dark"]) {
     await page("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }, { name: "prefers-color-scheme", value: scheme }] });
-    await type(input, "а".repeat(limit + 100 + (scheme === "dark" ? 1 : 0)));
-    const long = await waitFor(async () => { const c = await counter(); return c.over && c; }, "пометка о превышении предела не появилась");
+    // Светлая фаза пересекает предел (одно объявление); в темной текст остается сверх предела (объявлений нет).
+    let long;
+    await announced(scheme, scheme === "light" ? 1 : 0, async () => { long = await exceed(scheme === "dark" ? 1 : 0); });
     ok(digits(long.text).endsWith(String(limit)), `${where} (${scheme})`, `в пометке нет предела ${limit}: ${show(long.text)}`);
     ok(long.tinted, `${where} (${scheme})`, "пометка не окрашена цветами предупреждения (--warn, --warn-wash)");
     ok((await shownText(scenario)).length > limit, where, "текст не превышает предел: проверка не проверяет превышение");
-    ok(await notices() === 1, `${where} (${scheme})`, `объявлений о превышении ${await notices()}, ожидалось одно (в области aria-live, без повтора на каждый символ)`);
   }
   await page("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
   ok(await ev(`document.querySelector(".toasts").matches('[role="status"][aria-live="polite"]')`), where, "область уведомлений не объявляется для чтения с экрана");
@@ -751,11 +782,19 @@ try {
   const longText = await shownText(scenario);
   sameText(await copy(scenario), longText, where, "в буфере не тот текст, что показан, при превышении");
   sameText((await download(scenario)).text, longText, where, "в файле не тот текст, что показан, при превышении");
-  // Возврат в пределы снимает пометку.
-  await type(input, "а");
-  const short = await waitFor(async () => { const c = await counter(); return !c.over && c; }, "пометка осталась при тексте в пределах");
+  // Возврат в пределы снимает пометку и не объявляется; новое превышение объявляется снова.
+  let short;
+  await announced("возврат в предел", 0, async () => { short = await within(); });
   ok(!/больше/.test(short.text) && !short.tinted, where, `в пределах счетчик похож на пометку: ${show(short.text)}`);
   ok((await shownText(scenario)).length <= limit, where, "текст в пределах длиннее предела");
+  await announced("повторное превышение", 1, () => exceed(2));
+  // То же после сброса: он возвращает в предел, а следующее превышение снова объявляется.
+  await announced("сброс", 0, async () => {
+    await click(reset);
+    await waitFor(async () => !(await counter()).over, "пометка осталась после сброса");
+  });
+  await choose(scenario, i, index);
+  await announced("превышение после сброса", 1, () => exceed(3));
   await click(reset);
 } catch (error) {
   fault("предел длины", `тест прерван: ${error.message}`);
