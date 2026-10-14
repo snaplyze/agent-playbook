@@ -46,15 +46,22 @@ function abort(message) {
   finish(1);
 }
 
-function finish(code) {
+// Код выхода задается первым делом: что бы ни случилось при очистке, он не станет нулевым при провале.
+// Очистки идут по очереди, в обратном порядке регистрации (Chrome, сервер, каталоги), и не мешают друг другу.
+async function finish(code) {
+  process.exitCode = code;
   if (finishing) return;
   finishing = true;
-  const done = Promise.allSettled(cleanups.splice(0).reverse().map((fn) => fn()));
-  const timer = setTimeout(() => process.exit(code), 8_000); // зависшая очистка не держит процесс
-  done.finally(() => {
-    clearTimeout(timer);
-    process.exit(code);
-  });
+  const timer = setTimeout(() => process.exit(code), 15_000); // зависшая очистка не держит процесс
+  for (const cleanup of cleanups.splice(0).reverse()) {
+    try {
+      await cleanup();
+    } catch (error) {
+      console.error(`smoke: очистка не удалась: ${error?.message ?? error}`);
+    }
+  }
+  clearTimeout(timer);
+  process.exit(code);
 }
 
 const deadline = setTimeout(() => abort(`не уложились в ${TOTAL_TIMEOUT / 1000} с`), TOTAL_TIMEOUT);
@@ -160,21 +167,25 @@ async function launch(bin, extraFlags, profile) {
   let stderr = "";
   child.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(-3000); });
   let exited = null;
-  child.on("exit", (code, signal) => { exited = { code, signal }; });
-  child.on("error", (error) => { exited = { code: null, signal: null, error }; });
+  const gone = new Promise((done) => {
+    child.on("exit", (code, signal) => { exited = { code, signal }; done(); });
+    child.on("error", (error) => { exited = { code: null, signal: null, error }; done(); });
+  });
   const portFile = join(profile, "DevToolsActivePort");
   const until = Date.now() + 20_000;
   while (Date.now() < until) {
     if (exited) break;
     if (existsSync(portFile)) {
       const [port, path] = readText(portFile).split("\n");
-      if (port && path) return { child, wsUrl: `ws://127.0.0.1:${port}${path}` };
+      if (port && path) return { child, gone, wsUrl: `ws://127.0.0.1:${port}${path}` };
     }
     await sleep(40);
   }
-  killTree(child);
+  const early = Boolean(exited && !exited.error); // завершился сам, не успев открыть порт: признак отказа песочницы
   const why = exited ? `завершился сразу (код ${exited.code ?? exited.signal ?? exited.error?.message})` : "не открыл порт за 20 с";
-  return { error: `Chrome ${why}${stderr.trim() ? `:\n${stderr.trim()}` : ""}` };
+  killTree(child);
+  await Promise.race([gone, sleep(3_000)]);
+  return { error: `Chrome ${why}${stderr.trim() ? `:\n${stderr.trim()}` : ""}`, early };
 }
 
 function killTree(child) {
@@ -271,9 +282,11 @@ const origin = `http://127.0.0.1:${server.address().port}`;
 
 const bin = findChrome();
 let launched = await launch(bin, [], join(temp, "profile"));
+if (launched.error && !launched.early) die(launched.error);
 if (launched.error) {
   // Без песочницы: на машинах, где пользовательские пространства имен запрещены (контейнеры, запуск от root),
-  // Chrome с песочницей не стартует. Страница своя и статичная, поэтому повтор допустим.
+  // Chrome с песочницей завершается сразу после запуска. Только в этом случае (не при таймауте и не при ошибке
+  // запуска файла) повтор без песочницы допустим: страница своя и статичная.
   const retry = await launch(bin, ["--no-sandbox"], join(temp, "profile-no-sandbox"));
   if (retry.error) die(`${launched.error}\nповтор с --no-sandbox:\n${retry.error}`);
   console.error("smoke: Chrome с песочницей не стартовал, запущен с --no-sandbox");
@@ -281,7 +294,7 @@ if (launched.error) {
 }
 cleanups.push(async () => {
   killTree(launched.child);
-  await sleep(150);
+  await Promise.race([launched.gone, sleep(5_000)]); // профиль удаляется только после выхода Chrome
 });
 
 const cdp = await Cdp.connect(launched.wsUrl);

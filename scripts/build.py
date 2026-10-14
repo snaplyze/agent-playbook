@@ -40,7 +40,7 @@ PROMPT_LIMIT = 20000  # символов: промпт отправляется 
 # Пустое обязательное значение: агент должен спросить, а не взять пример из подсказки поля.
 MISSING = "<не указано: спроси владельца, не угадывай>"
 # Пробельные символы ввода: Юникодный White_Space, разделители C0 (\x1c-\x1f) и U+FEFF (его считает пробелом JS).
-# Тело класса символов, одно и то же для re и для RegExp страницы: build_site подставляет его в скрипт
+# Тело класса символов, одно и то же для re и для RegExp страницы: render_site подставляет его в скрипт
 # страницы на место @WHITESPACE@, поэтому clean здесь и clean там не расходятся.
 WHITESPACE = r"\t\n\v\f\r \x1c-\x1f\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 SPACES = re.compile(f"[{WHITESPACE}]+")
@@ -744,7 +744,8 @@ def fill(text, values, where):
     return MARK.sub(put, text)
 
 
-def build_site(scenarios, built, out):
+def render_site(scenarios, built):
+    """Текст страницы из scripts/page/ и сценариев; ошибка шаблона (неизвестная метка и т. п.) — fail."""
     data = [{"id": s["id"], "file": s["file"], "before": split(s)[0], "after": split(s)[1], "params": s["params"]}
             for s in scenarios]
     rail = "".join(f'<li><a href="#{html.escape(s["id"])}" data-id="{html.escape(s["id"])}">'
@@ -763,6 +764,10 @@ def build_site(scenarios, built, out):
         "ICON_AUTO": ICON["auto"], "ICON_SUN": ICON["sun"], "ICON_MOON": ICON["moon"],
         "REPO": html.escape(REPO), "BUILT": built_from,
     }, "page.html")
+    return page
+
+
+def build_site(page, out):
     out.mkdir(parents=True, exist_ok=True)
     (out / "index.html").write_text(page, encoding="utf-8")
     print(f"{out / 'index.html'}: {len(page.encode())} байт")
@@ -779,6 +784,7 @@ def main():
     current_readme = read(README)
     readme = render_readme(current_readme, readme_tables(scenarios, built))
     variants = all_variants(scenarios) if args.check or args.parity_cases else []
+    page = render_site(scenarios, built) if args.check or args.site else None  # --check собирает страницу и без записи
     if args.check:
         errors = check(scenarios, rules, built, variants, repo_files(), readme, current_readme)
         for s, text in zip(scenarios, built):
@@ -797,7 +803,7 @@ def main():
         README.write_text(readme, encoding="utf-8")
         print(f"собрано: {len(built)} промптов, таблицы README")
     if args.site:
-        build_site(scenarios, built, args.site)
+        build_site(page, args.site)
     if args.parity_cases:
         args.parity_cases.write_text(json.dumps(parity_cases(variants), ensure_ascii=False), encoding="utf-8")
         print(f"{args.parity_cases}: случаев {len(variants)}")
