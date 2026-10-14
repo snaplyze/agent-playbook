@@ -1,7 +1,7 @@
 (() => {
   const root = document.documentElement;
   root.classList.add("js");
-  const { scenarios: data, missing } = JSON.parse(document.getElementById("data").textContent);
+  const { scenarios: data, missing, limit } = JSON.parse(document.getElementById("data").textContent);
   const { clean, model: modelOf, compose } = playbook;
   const reduced = matchMedia("(prefers-reduced-motion: reduce)");
   const narrow = matchMedia("(max-width: 640px)");
@@ -230,7 +230,7 @@
     const fields = [...section.querySelectorAll(".field[data-index]")];
     const selects = new Map();
     const touched = new Set(); // поля, у которых пустое значение уже показано подсказкой
-    let text = "", previous = null;
+    let text = "", previous = null, over = false;
 
     if ("IntersectionObserver" in window) {
       new IntersectionObserver(([entry]) => bar.classList.toggle("is-stuck", !entry.isIntersecting && entry.boundingClientRect.top < 0))
@@ -302,7 +302,13 @@
       const changed = previous ? lines.map((line, i) => line !== previous[i] ? i : -1).filter((i) => i >= 0) : [];
       previous = lines;
       pre.innerHTML = highlight(text, { first: result.first, count: lines.length }, changed);
-      meta.textContent = count(text.length);
+      // Предел длины: пометка у счетчика всегда видна, объявление для чтения с экрана — один раз при пересечении
+      // предела, а не на каждый символ ввода. Копирование и скачивание остаются доступны.
+      const longer = text.length > limit;
+      meta.textContent = count(text.length) + (longer ? " — больше " + limit.toLocaleString("ru-RU") : "");
+      meta.classList.toggle("is-over", longer);
+      if (longer && !over) toast("warn", "Промпт длиннее " + count(limit) + ": клиент может не принять его одним сообщением", 8000);
+      over = longer;
       changed.forEach((i) => replay(fields[i], "is-pulse"));
       if (resetButton) resetButton.disabled = text === defaultText;
     }
@@ -337,12 +343,15 @@
     section.querySelector('[data-action="copy"]').addEventListener("click", (event) => {
       const button = event.currentTarget;
       if (blocked()) return;
-      // writeText вызывается в обработчике клика: пока жива пользовательская активация.
-      navigator.clipboard.writeText(text).then(
+      // writeText вызывается в обработчике клика: пока жива пользовательская активация. Промис из исполнителя ловит и
+      // синхронный сбой (нет navigator.clipboard), и отказ: у обоих один запасной путь.
+      new Promise((resolve) => resolve(navigator.clipboard.writeText(text))).then(
         () => done(button, "Скопировано", "ok", "Промпт скопирован: " + count(text.length)),
         () => {
+          // Конец выделения — начало следующего узла: иначе браузер не включает в копию завершающий перевод строки.
           const range = document.createRange();
-          range.selectNodeContents(pre);
+          range.setStart(pre, 0);
+          if (pre.nextSibling) range.setEnd(pre.nextSibling, 0); else range.setEndAfter(pre);
           getSelection().removeAllRanges();
           getSelection().addRange(range);
           done(button, "Выделено", "warn", "Буфер обмена недоступен. Текст выделен: нажмите Ctrl+C");
