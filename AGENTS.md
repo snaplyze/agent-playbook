@@ -6,7 +6,7 @@
 - Быстрый сигнал после любой правки, включая AGENTS.md: `python3 scripts/build.py --check`; нужен Python 3.11+. Если правил `src/`, README или `scripts/build.py`, перед ним запусти `python3 scripts/build.py`.
 - Полная проверка, как в CI: `python3 scripts/build.py --check --site <tmp>/site --parity-cases <tmp>/cases.json`, затем `node scripts/parity.mjs <tmp>/site/index.html <tmp>/cases.json`, где `<tmp>` — временный каталог вне репозитория; нужен Node.
 - План: `docs/plan.md`.
-- CI (обнаружено, 2026-10-13): hosted — workflow `check` (задание `check`) и `pages` (задания `build`, `deploy`) на `ubuntu-latest`; self-hosted раннеров нет: у репозитория 0, владелец — личный аккаунт без раннеров организации.
+- CI (обнаружено, 2026-10-13): hosted — workflow `ci` на `ubuntu-24.04`: задание `check` на каждый PR и push в `main`, после него на `main` — `deploy` страницы; self-hosted раннеров нет: у репозитория 0, владелец — личный аккаунт без раннеров организации.
 - Оркестрация: у владельца — роли пользовательского плагина `orchestration` (explorer, researcher, worker, tester, reviewer), у всех — встроенные подагенты Claude Code; вложенность ограничена одним уровнем через `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1` в `.claude/settings.json`.
 - Доступ (решение владельца): полный, неинтерактивный — задан в пользовательских настройках владельца и другим участникам ничего не разрешает. Claude Code берет `bypassPermissions` только из пользовательских или управляемых настроек и флага запуска, а из `.claude/settings*.json` игнорирует и стартует в ручном режиме, поэтому `defaultMode` в настройки проекта не пиши.
 
