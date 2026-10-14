@@ -489,7 +489,7 @@ const staticTexts = await ev(`(() => {
 const policy = await ev(`document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.content ?? ""`);
 ok(/default-src 'none'/.test(policy) && /script-src 'sha256-/.test(policy) && !/unsafe-/.test(policy), "страница", `нет политики CSP без небезопасных источников: ${show(policy)}`);
 
-let driven = 0, skipped = 0;
+let driven = 0, skipped = 0, areaChecks = 0;
 for (const scenario of scenarios) {
   const where = `${scenario.id}`;
   try {
@@ -591,6 +591,25 @@ for (const scenario of scenarios) {
       }
     }
 
+    // Область запоминается: вариант с выбором области, ввод, вторая область, вариант без области и снова первый вариант —
+    // область прежняя.
+    for (const [i, param] of scenario.params.entries()) {
+      const index = param.option?.findIndex((o) => o.choice?.length > 1) ?? -1;
+      const other = param.option?.findIndex((o, k) => k !== index && !o.choice) ?? -1;
+      if (index < 0 || other < 0) continue;
+      const label = `${where} параметр «${param.key}»`;
+      const area = param.option[index].choice[1];
+      await choose(scenario, i, index);
+      if (param.option[index].input !== undefined) await type(`${field(scenario, i)} .extra-input`, "значение");
+      await click(`${field(scenario, i)} .extra-choice .seg:nth-child(2)`);
+      await choose(scenario, i, other);
+      await choose(scenario, i, index);
+      const kept = (await readControls(scenario))[i];
+      areaChecks += 1;
+      ok(kept.choice === area, label, `область после перехода в другой вариант и обратно: ${show(kept.choice)}, ожидалось ${show(area)}`);
+      await click(reset);
+    }
+
     // Копирование и скачивание при измененных значениях: ровно показанный текст.
     const contrast = own.filter((c) => typeable(c.states)).at(-1);
     await applyStates(scenario, contrast.states);
@@ -605,6 +624,7 @@ for (const scenario of scenarios) {
     fault(where, `тест прерван: ${error.message}`);
   }
 }
+ok(areaChecks > 0, "область", "не проверено сохранение области при смене варианта");
 ok(driven > 0, "случаи", "не воспроизведено ни одного случая из cases.json");
 
 ok(externalRequests.length === 0, "сеть", `внешние запросы со страницы:\n    ${externalRequests.join("\n    ")}`);

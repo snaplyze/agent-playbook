@@ -240,8 +240,6 @@
       const param = model.params[field.dataset.index];
       if (param.choices) return;
       selects.set(field, makeSelect(field, param, () => {
-        // Другой вариант — другая область: выбор области начинается с умолчания.
-        sync(field, { ...read(field), choice: "" });
         render();
         const input = field.querySelector(".extra-input:not([hidden])");
         if (input && !clean(input.value)) input.focus();
@@ -254,7 +252,7 @@
       if (param.choices) return { picked: [...field.querySelectorAll("input:checked")].map((input) => input.value) };
       const input = field.querySelector(".extra-input");
       const choice = field.querySelector(".extra-choice");
-      const radio = choice && !choice.hidden && choice.querySelector("input:checked");
+      const radio = choice && choice.querySelector("input:checked");
       return { index: selects.get(field).value(), input: input ? input.value : "", choice: radio ? radio.value : "" };
     }
     // Синхронизация: приводит элементы управления и то, что из них следует (видимость поля значения и области,
@@ -282,20 +280,22 @@
       }
       if (choice) {
         choice.hidden = !option.choice;
-        if (option.choice) {
-          const built = [...choice.querySelectorAll("input")].map((radio) => radio.value);
-          if (built.length !== option.choice.length || built.some((value, i) => value !== option.choice[i])) {
-            choice.innerHTML = option.choice.map((value) => '<label class="seg"><input type="radio" name="' + field.querySelector(".select-trigger").id +
-              '-choice" value="' + esc(value) + '"><span>' + esc(value) + "</span></label>").join("");
-          }
-          choice.querySelectorAll("input").forEach((radio) => { radio.checked = radio.value === (state.choice || option.choice[0]); });
+        // Выбранная область сохраняется, пока список областей тот же; другой список строится заново с первого значения.
+        let wanted = state.choice;
+        const built = [...choice.querySelectorAll("input")].map((radio) => radio.value);
+        if (option.choice && (built.length !== option.choice.length || built.some((value, i) => value !== option.choice[i]))) {
+          choice.innerHTML = option.choice.map((value) => '<label class="seg"><input type="radio" name="' + field.querySelector(".select-trigger").id +
+            '-choice" value="' + esc(value) + '"><span>' + esc(value) + "</span></label>").join("");
+          wanted = "";
         }
+        const radios = [...choice.querySelectorAll("input")];
+        radios.forEach((radio) => { radio.checked = radio.value === (wanted || radios[0].value); });
       }
       if (extra) extra.dataset.open = String(Boolean(input && !input.hidden || choice && !choice.hidden));
     }
     function render() {
+      fields.forEach((field) => sync(field, read(field)));
       const states = fields.map(read);
-      fields.forEach((field, i) => sync(field, states[i]));
       const result = compose(model, states, missing);
       const lines = result.lines;
       text = result.text;

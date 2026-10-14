@@ -732,7 +732,8 @@ def scenario_section(scenario, built):
     <button type="button" class="btn btn-secondary" data-action="download"><span class="btn-icons">{ICON["download"]}{ICON["check"]}</span><span class="btn-label">Скачать .md</span></button>
     <span class="meta"></span>
   </div>
-  <pre class="prompt" tabindex="0" aria-label="Текст промпта">{html.escape(built, quote=False)}</pre>
+  <pre class="prompt" tabindex="0" aria-label="Текст промпта">
+{html.escape(built, quote=False)}</pre>
 </section>"""
 
 
@@ -837,7 +838,7 @@ def render_site(scenarios, built):
 
 def build_site(page, out):
     out.mkdir(parents=True, exist_ok=True)
-    (out / "index.html").write_text(page, encoding="utf-8")
+    (out / "index.html").write_text(page, encoding="utf-8", newline="\n")
     print(f"{out / 'index.html'}: {len(page.encode())} байт")
 
 
@@ -867,13 +868,13 @@ def main():
         for stale in set(PROMPTS.glob("*.md")) - {PROMPTS / s["file"] for s in scenarios}:
             stale.unlink()
         for s, text in zip(scenarios, built):
-            (PROMPTS / s["file"]).write_text(text, encoding="utf-8")
-        README.write_text(readme, encoding="utf-8")
+            (PROMPTS / s["file"]).write_text(text, encoding="utf-8", newline="\n")
+        README.write_text(readme, encoding="utf-8", newline="\n")
         print(f"собрано: {len(built)} промптов, таблицы README")
     if args.site:
         build_site(page, args.site)
     if args.parity_cases:
-        args.parity_cases.write_text(json.dumps(parity_cases(variants), ensure_ascii=False), encoding="utf-8")
+        args.parity_cases.write_text(json.dumps(parity_cases(variants), ensure_ascii=False), encoding="utf-8", newline="\n")
         print(f"{args.parity_cases}: случаев {len(variants)}")
 
 

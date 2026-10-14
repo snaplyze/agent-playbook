@@ -57,6 +57,10 @@ if (broken.length) die(broken.join("\n"));
 const policy = page.match(/<meta http-equiv="Content-Security-Policy" content="([^"]*)">/)?.[1]
   .replaceAll("&#x27;", "'").replaceAll("&amp;", "&") ?? die(`${pagePath}: нет <meta http-equiv="Content-Security-Policy">`);
 const sources = (directive) => policy.split(";").map((part) => part.trim().split(/\s+/)).find(([name]) => name === directive)?.slice(1) ?? [];
+// Политика действует только на то, что идет после нее: <meta> стоит в <head> раньше любого скрипта и стиля.
+const metaAt = page.search(/<meta http-equiv="Content-Security-Policy"/);
+const firstCode = page.search(/<(?:script|style)\b/i);
+if (metaAt < page.search(/<head\b/i) || metaAt > page.indexOf("</head>") || metaAt > firstCode) die("CSP: <meta> должен стоять в <head> раньше первого <script> и <style>");
 if (/unsafe-/.test(policy)) die(`CSP разрешает небезопасное: ${policy}`);
 const hash = (code) => `'sha256-${createHash("sha256").update(code).digest("base64")}'`;
 for (const script of executable) {
@@ -88,7 +92,7 @@ const { model: modelOf, compose } = vm.runInNewContext(`${logic}\nplaybook`, {},
 // экранированы только <, > и &; любая другая сущность значила бы, что разбор здесь разошелся с браузером.
 const unescape = (text) => text.replace(/&(lt|gt|amp);|&[#\w]+;/g, (entity, name) => ({ lt: "<", gt: ">", amp: "&" })[name] ?? die(`<pre>: неожиданная сущность ${entity}`));
 const texts = new Map([...page.matchAll(/<section class="scenario" id="([^"]+)"[\s\S]*?<pre class="prompt"[^>]*>([\s\S]*?)<\/pre>/g)]
-  .map(([, id, text]) => [id, unescape(text)]));
+  .map(([, id, text]) => [id, unescape(text.replace(/^\n/, ""))])); // браузер отбрасывает один перевод строки сразу после <pre>
 const models = new Map(data.scenarios.map((scenario) => {
   const text = texts.get(scenario.id) ?? die(`${pagePath}: у сценария ${scenario.id} нет <pre> с текстом`);
   return [scenario.id, { model: modelOf(scenario, text), text }];
