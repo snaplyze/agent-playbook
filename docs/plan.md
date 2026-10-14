@@ -117,7 +117,7 @@
 
 #### CI-1. Для `main` нет обязательных проверок
 - Тип: процесс. Приоритет: P2 — PR с красной проверкой можно влить, `prompts/` и README в `main` разойдутся с `src/`. Уверенность: высокая.
-- Доказательство: `gh api repos/snaplyze/agent-playbook/branches/main` — `protected: false`; rulesets и `rules/branches/main` пусты. Пока все PR влиты с успешным `check`, публикацию страницы страхует повтор проверки в `pages/build`.
+- Доказательство: `gh api repos/snaplyze/agent-playbook/branches/main` — `protected: false`; rulesets и `rules/branches/main` пусты. Пока все PR влиты с успешным `check`; публикацию страницы страхует `check` в том же прогоне `ci` на `main`.
 - Решение (S, владелец): ruleset на `main` — обязательный PR, обязательная проверка `check`, запрет force-push и удаления, по желанию актуальная ветка. Риск: имя проверки должно совпадать с заданием (CI-3); `paths` в workflow проверки после этого не добавлять.
 - Зависимости: CI-3 — обязательная проверка — задание `check` workflow `ci`.
 - Приемка: `gh api repos/snaplyze/agent-playbook/rules/branches/main` показывает `required_status_checks` с `check`, `non_fast_forward` и `deletion`.
@@ -275,7 +275,7 @@
 - Решение (S): один workflow: `check` на PR и push, `build` с `needs: check` только вне PR, `deploy` после `build`; для PR — `concurrency` с `cancel-in-progress`, для `main` — без отмены.
 - Зависимости: нет; задание проверки сохраняет имя `check` — его потребует CI-1.
 - Приемка: на push в `main` проверка выполняется один раз на SHA; деплой — только после успешного `check`.
-- Статус: DONE. Решение — один workflow `ci.yml` вместо `check.yml` и `pages.yml`: задание `check` на PR, push в `main` и ручной запуск; на `main` оно же загружает собранную и проверенную страницу, `deploy` идет после него; отдельной сборки нет. `concurrency` по номеру PR отменяет устаревший прогон, вне PR группа уникальна; `deploy` — в группе `pages` без отмены. Проверка — actionlint, прогоны PR.
+- Статус: DONE, кроме проверки на `main` после слияния. Решение — один workflow `ci.yml` вместо `check.yml` и `pages.yml`: задание `check` на PR, push в `main` и ручной запуск; на `main` оно же загружает собранную и проверенную страницу, `deploy` идет после него; отдельной сборки нет. `concurrency` по номеру PR отменяет устаревший прогон, а на ветке прогоны идут по очереди без отмены, и страница не откатится на старый коммит. Проверка — actionlint, прогон PR. Следующий шаг — на `main` один прогон на SHA, `deploy` после `check`.
 
 #### CI-4. Закрепленные actions никто не обновляет
 - Тип: цепочка поставки. Приоритет: P3 — сейчас все SHA актуальны. Уверенность: высокая.

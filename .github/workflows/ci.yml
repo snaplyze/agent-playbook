@@ -9,10 +9,11 @@ on:
 permissions:
   contents: read
 
-# Новый коммит в PR отменяет устаревший прогон; вне PR группа уникальна, и каждый прогон доходит до конца.
+# Новый коммит в PR отменяет устаревший прогон. На ветке прогоны идут по очереди и не прерываются,
+# поэтому страница не откатится на старый коммит; из ожидающих остается последний.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
@@ -41,9 +42,6 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    concurrency:
-      group: pages
-      cancel-in-progress: false
     steps:
       - id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
