@@ -7,7 +7,7 @@
 //
 // Что проверяется (всё через настоящие события мыши и клавиатуры, как у пользователя): начальный текст каждого
 // сценария (<pre>, исходный HTML и то, что копируется) равен ожидаемому тексту случая «все по умолчанию»; выбор
-// варианта в комбобоксе, ввод с лишними пробелами, выбор области, снятие и установка чипов дают текст случая из
+// варианта в комбобоксе, ввод с лишними пробелами, снятие и установка чипов дают текст случая из
 // cases.json; пустое обязательное поле блокирует копирование и скачивание и подсвечивается; копирование кладет в
 // буфер ровно показанный текст, скачивание дает файл NN-имя.md с тем же текстом; сброс возвращает умолчания,
 // очищает ввод и восстанавливает чипы; на странице нет исключений и ошибок консоли; страница не делает внешних запросов
@@ -419,11 +419,11 @@ const field = (scenario, i) => `#${scenario.id} .field[data-index="${i}"]`;
 const highlighted = (scenario) => ev(`[...document.querySelectorAll("#${scenario.id} .prompt .p")].map((el) => el.textContent)`);
 const shownText = (scenario) => ev(`document.querySelector("#${scenario.id} .prompt").textContent`);
 
-// Состояние элементов управления сценария, как в cases.json: options — индекс, ввод и область; chips — отмеченные.
+// Состояние элементов управления сценария, как в cases.json: options — индекс и ввод; chips — отмеченные.
 const readControls = (scenario) => ev(`[...document.querySelectorAll("#${scenario.id} .field[data-index]")].map((field) => {
   if (field.querySelector(".chips")) return { picked: [...field.querySelectorAll("input:checked")].map((i) => i.value) };
-  const input = field.querySelector(".extra-input"), choice = field.querySelector(".extra-choice input:checked");
-  return { index: Number(field.querySelector(".select-trigger").dataset.value), input: input ? input.value : "", choice: choice ? choice.value : "" };
+  const input = field.querySelector(".extra-input");
+  return { index: Number(field.querySelector(".select-trigger").dataset.value), input: input ? input.value : "" };
 })`);
 
 async function openScenario(scenario) {
@@ -458,9 +458,6 @@ async function applyStates(scenario, states) {
     }
     const option = param.option[want.index];
     if (option.input !== undefined && want.input !== have.input) await type(`${f} .extra-input`, want.input);
-    if (option.choice && want.choice && want.choice !== have.choice) {
-      await click(`${f} .extra-choice .seg:nth-child(${option.choice.indexOf(want.choice) + 1})`);
-    }
   }
 }
 
@@ -515,7 +512,7 @@ ok(show(sectionIds) === show(scenarios.map((s) => s.id)), "страница", `�
 
 // Состояния по умолчанию берутся из данных страницы; что они совпадают с показанным в начале, проверяют начальный текст
 // и текст после сброса.
-const normal = (state) => state.picked ? { picked: [...state.picked].sort() } : { index: state.index, input: state.input || "", choice: state.choice || "" };
+const normal = (state) => state.picked ? { picked: [...state.picked].sort() } : { index: state.index, input: state.input || "" };
 const defaultStates = (scenario) => scenario.defaults.map(normal);
 const isDefault = (scenario, states) => show(states.map(normal)) === show(defaultStates(scenario));
 const fileName = async (scenario) => `${await ev(`document.querySelector("#${scenario.id} h2 .num").textContent`)}-${scenario.id}.md`;
@@ -530,7 +527,7 @@ const staticTexts = await ev(`(() => {
 const policy = await ev(`document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.content ?? ""`);
 ok(/default-src 'none'/.test(policy) && /script-src 'sha256-/.test(policy) && !/unsafe-/.test(policy), "страница", `нет политики CSP без небезопасных источников: ${show(policy)}`);
 
-let driven = 0, skipped = 0, areaChecks = 0;
+let driven = 0, skipped = 0;
 for (const scenario of scenarios) {
   const where = `${scenario.id}`;
   try {
@@ -550,7 +547,7 @@ for (const scenario of scenarios) {
     ok(file.name === name, where, `имя скачанного файла ${show(file.name)}, ожидалось ${show(name)}`);
     sameText(file.text, expected, where, "скачанный текст при значениях по умолчанию");
 
-    // Все случаи, которые можно воспроизвести вводом: смена вариантов, ввод, область, чипы, сочетания.
+    // Все случаи, которые можно воспроизвести вводом: смена вариантов, ввод, чипы, сочетания.
     for (const item of own) {
       if (!typeable(item.states)) { skipped += 1; continue; }
       driven += 1;
@@ -570,7 +567,7 @@ for (const scenario of scenarios) {
       const index = param.option?.findIndex((o) => o.input !== undefined) ?? -1;
       if (index < 0) continue;
       const blockedLabel = `${where} параметр «${param.key}»`;
-      await applyStates(scenario, defaultStates(scenario).map((s, k) => k === i ? { index, input: "", choice: "" } : s));
+      await applyStates(scenario, defaultStates(scenario).map((s, k) => k === i ? { index, input: "" } : s));
       await setClipboard(SENTINEL);
       const filesBefore = downloads.length;
       await click(`#${scenario.id} [data-action="copy"]`);
@@ -625,30 +622,9 @@ for (const scenario of scenarios) {
         await choose(scenario, i, index);
         const again = (await readControls(scenario))[i];
         ok(again.input === "", where, `ввод «${param.key}» после сброса и повторного выбора не пуст`);
-        const area = param.option[index].choice;
-        if (area) ok(again.choice === area[0], where, `область «${param.key}» после сброса и повторного выбора: ${show(again.choice)}, ожидалось ${show(area[0])}`);
         ok((await shownText(scenario)).includes(data.missing), where, `текст после сброса и повторного выбора «${param.key}» без пометки о пустом вводе`);
         await click(reset);
       }
-    }
-
-    // Область запоминается: вариант с выбором области, ввод, вторая область, вариант без области и снова первый вариант —
-    // область прежняя.
-    for (const [i, param] of scenario.params.entries()) {
-      const index = param.option?.findIndex((o) => o.choice?.length > 1) ?? -1;
-      const other = param.option?.findIndex((o, k) => k !== index && !o.choice) ?? -1;
-      if (index < 0 || other < 0) continue;
-      const label = `${where} параметр «${param.key}»`;
-      const area = param.option[index].choice[1];
-      await choose(scenario, i, index);
-      if (param.option[index].input !== undefined) await type(`${field(scenario, i)} .extra-input`, "значение");
-      await click(`${field(scenario, i)} .extra-choice .seg:nth-child(2)`);
-      await choose(scenario, i, other);
-      await choose(scenario, i, index);
-      const kept = (await readControls(scenario))[i];
-      areaChecks += 1;
-      ok(kept.choice === area, label, `область после перехода в другой вариант и обратно: ${show(kept.choice)}, ожидалось ${show(area)}`);
-      await click(reset);
     }
 
     // Копирование и скачивание при измененных значениях: ровно показанный текст.
@@ -665,7 +641,6 @@ for (const scenario of scenarios) {
     fault(where, `тест прерван: ${error.message}`);
   }
 }
-ok(areaChecks > 0, "область", "не проверено сохранение области при смене варианта");
 ok(driven > 0, "случаи", "не воспроизведено ни одного случая из cases.json");
 
 // --- Запасной путь копирования -------------------------------------------------------------------------------

@@ -100,7 +100,7 @@ def read(path):
 SCENARIO_KEYS = {"file", "name", "when", "result", "never", "param"}
 OPTION_PARAM_KEYS = {"key", "help", "option"}
 CHOICES_PARAM_KEYS = {"key", "help", "choices", "default", "all", "none", "some"}
-OPTION_KEYS = {"label", "line", "input", "choice"}
+OPTION_KEYS = {"label", "line", "input"}
 FILE_NAME = re.compile(r"(\d{2})-([a-z0-9]+(?:-[a-z0-9]+)*)\.md")
 
 
@@ -172,12 +172,8 @@ def validate_param(where, param):
             string_field(option, "input", place)
             if number == 1:
                 fail(f"{place}: первый вариант — значение по умолчанию, он не может требовать ввода")
-        if "choice" in option:
-            single_line(place, "choice", *string_list(option, "choice", place))
         if ("{input}" in line) != ("input" in option):
             fail(f"{place}: {{input}} и поле input должны быть вместе")
-        if ("{choice}" in line) != ("choice" in option):
-            fail(f"{place}: {{choice}} и поле choice должны быть вместе")
 
 
 @functools.cache
@@ -271,8 +267,6 @@ def param_text(param, state):
     text = option["line"]
     if "input" in option:
         text = text.replace("{input}", clean(state.get("input", "")) or MISSING)
-    if "choice" in option:
-        text = text.replace("{choice}", state.get("choice") or option["choice"][0])
     return text
 
 
@@ -310,8 +304,8 @@ def filled_input(index):
 
 def param_variants(param, index, thorough):
     """Состояния одного параметра: каждый вариант, у варианта с вводом — заполненный и пустой ввод (при thorough
-    еще ввод с каждым пробельным символом по краям и внутри и ввод из одних пробельных символов), у варианта
-    с выбором — каждое значение; для множественного выбора — пустой, полный и два частичных набора."""
+    еще ввод с каждым пробельным символом по краям и внутри и ввод из одних пробельных символов); для множественного
+    выбора — пустой, полный и два частичных набора."""
     if "choices" in param:
         picked = ([], param["choices"], param["choices"][:1], param["choices"][1:])
         return [{"picked": list(p)} for p in picked]
@@ -322,19 +316,17 @@ def param_variants(param, index, thorough):
             inputs = [filled_input(index), ""]
             if thorough:
                 inputs += [f"{c}ввод{c}{c}значение{c}" for c in SPACE_PROBES] + ["".join(SPACE_PROBES)]
-        for choice in option.get("choice", [""]):
-            variants += [{"index": position, "input": value, "choice": choice} for value in inputs]
+        variants += [{"index": position, "input": value} for value in inputs]
     return variants
 
 
 def contrast_state(param, index):
-    """Состояние, отличное от состояния по умолчанию: последний вариант, его ввод и последнее значение выбора."""
+    """Состояние, отличное от состояния по умолчанию: последний вариант и его ввод."""
     if "choices" in param:
         return {"picked": param["choices"][1:] if param["default"] == "all" else param["choices"][:1]}
     position = len(param["option"]) - 1
     option = param["option"][position]
-    return {"index": position, "input": filled_input(index) if "input" in option else "",
-            "choice": option.get("choice", [""])[-1]}
+    return {"index": position, "input": filled_input(index) if "input" in option else ""}
 
 
 def variant_states(scenario):
@@ -370,7 +362,7 @@ REFERENCE_PARAMS = [
     {"key": "Режим", "option": [
         {"label": "а", "line": "обычный."},
         {"label": "б", "line": "со вводом: {input}.", "input": "п"},
-        {"label": "в", "line": "в «{choice}»: {input}.", "input": "п", "choice": ["раз", "два"]}]},
+        {"label": "в", "line": "повтор: {input} и {input}.", "input": "п"}]},
     {"key": "Набор", "choices": ["x", "y", "z"], "default": "none",
      "all": "все: {selected}.", "none": "ничего: {all}.", "some": "часть: {selected}; остальное: {rest}."},
     {"key": "Пара", "choices": ["p", "q"], "default": "all", "all": "{all}!", "none": "нет", "some": "{selected}/{rest}"},
@@ -382,10 +374,10 @@ REFERENCE_CASES = [  # (состояния параметров, ожидаем�
      "до\n\n## Параметры\n- Режим: со вводом: привет мир.\n- Набор: часть: y; остальное: x, z.\n- Пара: нет\n\nпосле"),
     ([{"index": 1, "input": "\ufeff\x85"}, {"picked": ["z", "y", "x"]}, {"picked": ["q"]}],
      f"до\n\n## Параметры\n- Режим: со вводом: {MISSING}.\n- Набор: все: x, y, z.\n- Пара: q/p\n\nпосле"),
-    ([{"index": 2, "input": "z$&", "choice": "два"}, {"picked": ["z", "x"]}, {"picked": ["p", "q"]}],
-     "до\n\n## Параметры\n- Режим: в «два»: z$&.\n- Набор: часть: x, z; остальное: y.\n- Пара: p, q!\n\nпосле"),
+    ([{"index": 2, "input": "z$&"}, {"picked": ["z", "x"]}, {"picked": ["p", "q"]}],
+     "до\n\n## Параметры\n- Режим: повтор: z$& и z$&.\n- Набор: часть: x, z; остальное: y.\n- Пара: p, q!\n\nпосле"),
     ([{"index": 2, "input": "a"}, {"picked": []}, {"picked": ["q", "p"]}],
-     "до\n\n## Параметры\n- Режим: в «раз»: a.\n- Набор: ничего: x, y, z.\n- Пара: p, q!\n\nпосле"),
+     "до\n\n## Параметры\n- Режим: повтор: a и a.\n- Набор: ничего: x, y, z.\n- Пара: p, q!\n\nпосле"),
 ]
 REFERENCE_NO_PARAMS = ({"text": f"до\n\n{PARAMS}\n\nпосле", "params": []}, "до\n\nпосле")
 
@@ -402,18 +394,8 @@ def check_reference(errors):
 
 # --- README: таблицы между маркерами -----------------------------------------------------------
 
-def or_list(items):
-    return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} или {items[-1]}"
-
-
 def option_label(option):
-    note = ""
-    if "input" in option and "choice" in option:
-        note = f" — со своим значением и выбором: {or_list(option['choice'])}"
-    elif "input" in option:
-        note = " — со своим значением"
-    elif "choice" in option:
-        note = f" — с выбором: {or_list(option['choice'])}"
+    note = " — со своим значением" if "input" in option else ""
     return option["label"].rstrip("…") + note
 
 
@@ -697,8 +679,6 @@ def param_field(scenario, index, param):
         extra += (f'<input type="text" class="extra-input" hidden autocomplete="off" spellcheck="false" '
                   f'aria-label="{esc(param["key"])}: значение" aria-describedby="{fid}-note">'
                   f'<p class="note" id="{fid}-note" hidden>Нужно значение: без него промпт не скопируется.</p>')
-    if any("choice" in o for o in param["option"]):
-        extra += f'<div class="segmented extra-choice" role="radiogroup" hidden aria-label="{esc(param["key"])}: область"></div>'
     extra = f'<div class="extra" data-open="false"><div>{extra}</div></div>' if extra else ""
     # Комбобокс по образцу WAI-ARIA APG «Select-Only Combobox»: кнопка-триггер + список в popover.
     return (f'<div class="field" data-index="{index}"><label class="label" id="{fid}-label" for="{fid}">{esc(param["key"])}</label>'
