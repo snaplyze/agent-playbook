@@ -147,11 +147,6 @@ html:not(.js) .params, html:not(.js) .theme { display: none; }
 .extra-input.is-shake { animation: shake .4s var(--ease); }
 @keyframes shake { 20%, 60% { translate: -4px 0; } 40%, 80% { translate: 4px 0; } }
 .note { margin: 0; font-size: 13px; line-height: 1.4; color: var(--warn); }
-.segmented { display: inline-grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 2px; justify-self: start; padding: 3px; border: 1px solid var(--rule); border-radius: var(--r2); background: var(--well); }
-.seg { position: relative; display: grid; place-items: center; min-height: 36px; padding: 0 14px; border-radius: calc(var(--r2) - 3px); color: var(--ink-soft); font-size: 15px; white-space: nowrap; cursor: pointer; transition: background var(--d2) var(--ease), color var(--d2) var(--ease), box-shadow var(--d2) var(--ease); }
-.seg input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; font: inherit; cursor: pointer; }
-.seg:has(input:checked) { background: var(--sheet); color: var(--ink); box-shadow: 0 1px 2px rgb(0 0 0 / .14); }
-.seg:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: -1px; }
 
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }
 .chip { position: relative; display: inline-flex; align-items: center; gap: 9px; min-height: 40px; padding: 6px 14px 6px 10px; border: 1px solid var(--rule); border-radius: 999px; background: var(--well); line-height: 1.3; cursor: pointer; -webkit-user-select: none; user-select: none; transition: background var(--d2) var(--ease), border-color var(--d2) var(--ease), color var(--d2) var(--ease), transform var(--d1) var(--ease); }

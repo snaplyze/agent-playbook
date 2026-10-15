@@ -17,7 +17,6 @@ var playbook = (() => {
     const option = param.option[state.index];
     let text = option.line;
     if (option.input !== undefined) text = put(text, "{input}", clean(state.input || "") || missing);
-    if (option.choice) text = put(text, "{choice}", state.choice || option.choice[0]);
     return text;
   }
   // Модель сценария: данные страницы и текст по умолчанию (его показывает <pre> без JS). Текст до и после раздела
