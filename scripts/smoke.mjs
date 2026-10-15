@@ -322,6 +322,12 @@ if (launched.error) {
 }
 
 const cdp = await Cdp.connect(launched.wsUrl);
+// Штатное закрытие идет до завершения процессов: только после Browser.close Chrome удаляет свой каталог
+// com.google.Chrome.* во временной папке системы, а после сигналов каталог остается.
+cleanups.push(async () => {
+  await Promise.race([cdp.send("Browser.close").catch(() => {}), sleep(3_000)]);
+  await Promise.race([launched.gone, sleep(3_000)]);
+});
 const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
 const { sessionId: sid } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
 const page = (method, params) => cdp.send(method, params, sid);
