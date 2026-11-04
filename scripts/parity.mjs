@@ -54,11 +54,27 @@ for (const script of executable) {
 if (broken.length) die(broken.join("\n"));
 
 // Политика CSP: каждый встроенный исполняемый скрипт и стиль указан хешем, небезопасных источников нет.
-const policy = page.match(/<meta http-equiv="Content-Security-Policy" content="([^"]*)">/)?.[1]
-  .replaceAll("&#x27;", "'").replaceAll("&amp;", "&") ?? die(`${pagePath}: нет <meta http-equiv="Content-Security-Policy">`);
+// Атрибуты meta разбираются по именам, а не по порядку: шаблон может поменять их местами.
+function metaAttributes(tag) {
+  const attrs = {};
+  for (const match of tag.matchAll(/([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g)) {
+    attrs[match[1].toLowerCase()] = match[2] ?? match[3] ?? match[4];
+  }
+  return attrs;
+}
+const htmlUnescape = (value) => value
+  .replaceAll("&#x27;", "'").replaceAll("&#39;", "'").replaceAll("&quot;", "\"")
+  .replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&");
+const cspTag = [...page.matchAll(/<meta\b[^>]*>/gi)]
+  .find((match) => metaAttributes(match[0])["http-equiv"]?.toLowerCase() === "content-security-policy") ?? die(`${pagePath}: нет <meta http-equiv="Content-Security-Policy">`);
+const policy = htmlUnescape(metaAttributes(cspTag[0]).content ?? "");
+if (!policy) die(`${pagePath}: у <meta http-equiv="Content-Security-Policy"> нет content`);
+if (htmlUnescape(metaAttributes('<meta content="default-src &#x27;none&#x27;" http-equiv="Content-Security-Policy">').content ?? "") !== "default-src 'none'") {
+  die("CSP: разбор meta зависит от порядка атрибутов");
+}
 const sources = (directive) => policy.split(";").map((part) => part.trim().split(/\s+/)).find(([name]) => name === directive)?.slice(1) ?? [];
 // Политика действует только на то, что идет после нее: <meta> стоит в <head> раньше любого скрипта и стиля.
-const metaAt = page.search(/<meta http-equiv="Content-Security-Policy"/);
+const metaAt = cspTag.index;
 const firstCode = page.search(/<(?:script|style)\b/i);
 if (metaAt < page.search(/<head\b/i) || metaAt > page.indexOf("</head>") || metaAt > firstCode) die("CSP: <meta> должен стоять в <head> раньше первого <script> и <style>");
 if (/unsafe-/.test(policy)) die(`CSP разрешает небезопасное: ${policy}`);
@@ -75,6 +91,7 @@ if (sources("default-src").join() !== "'none'") die(`CSP: default-src долже
 const logic = scripts.find((s) => s.id === "logic")?.code ?? die(`${pagePath}: нет скрипта <script id="logic">`);
 const dataText = scripts.find((s) => s.id === "data")?.code ?? die(`${pagePath}: нет данных <script id="data">`);
 let data;
+let payload;
 let cases;
 try {
   data = JSON.parse(dataText);
@@ -82,10 +99,21 @@ try {
   die(`${pagePath}: данные страницы не разбираются как JSON: ${error.message}`);
 }
 try {
-  cases = JSON.parse(readText(casesPath));
+  payload = JSON.parse(readText(casesPath));
 } catch (error) {
   die(`${casesPath}: не разбирается как JSON: ${error.message}`);
 }
+const stable = (value) => Array.isArray(value)
+  ? `[${value.map(stable).join(",")}]`
+  : value && typeof value === "object"
+    ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(",")}}`
+    : JSON.stringify(value);
+if (!payload || payload.version !== 1 || !Array.isArray(payload.cases) || payload.count !== payload.cases.length) {
+  die(`${casesPath}: нужен cases.json с манифестом version/count/scenarios/sha256 и полным набором случаев`);
+}
+cases = payload.cases;
+const digest = createHash("sha256").update(stable(cases)).digest("hex");
+if (payload.sha256 !== digest) die(`${casesPath}: хеш случаев не совпадает с манифестом; файл изменен или усечен`);
 const { model: modelOf, compose } = vm.runInNewContext(`${logic}\nplaybook`, {}, { filename: "<script id=\"logic\">" });
 
 // Текст по умолчанию каждого сценария — содержимое его <pre>, как его читает страница (textContent). В разметке
@@ -107,6 +135,18 @@ cases.forEach((item, i) => {
 });
 const uncovered = [...models.keys()].filter((id) => !perScenario.has(id));
 if (uncovered.length) die(`${casesPath}: нет случаев для сценариев страницы: ${uncovered.join(", ")}`);
+if (!payload.scenarios || typeof payload.scenarios !== "object" || Array.isArray(payload.scenarios)) {
+  die(`${casesPath}: в манифесте нет карты scenarios`);
+}
+const manifestIds = Object.keys(payload.scenarios);
+if (manifestIds.length !== models.size || manifestIds.some((id) => !models.has(id))) {
+  die(`${casesPath}: манифест перечисляет не те сценарии: ${manifestIds.join(", ")}`);
+}
+for (const id of models.keys()) {
+  if (payload.scenarios[id] !== perScenario.get(id)) {
+    die(`${casesPath}: покрытие ${id} — ${perScenario.get(id) ?? 0} случаев, в манифесте ${payload.scenarios[id]}`);
+  }
+}
 
 // Индекс первого различия в единицах UTF-16 (как у slice и индексов строк), до длины большей строки.
 function firstDifference(a, b) {

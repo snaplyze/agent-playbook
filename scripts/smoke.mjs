@@ -105,13 +105,18 @@ function readText(path) {
 const pagePath = pagePathOf(pageArg);
 readText(pagePath); // понятная ошибка до запуска браузера
 const casesText = readText(casesPath);
+let payload;
 let cases;
 try {
-  cases = JSON.parse(casesText);
+  payload = JSON.parse(casesText);
 } catch (error) {
   die(`${casesPath}: не разбирается как JSON: ${error.message}`);
 }
-if (!Array.isArray(cases) || !cases.length) die(`${casesPath}: нет ни одного случая`);
+if (!payload || payload.version !== 1 || !Array.isArray(payload.cases) || payload.count !== payload.cases.length) {
+  die(`${casesPath}: неполный cases.json: нужен манифест version/count/scenarios/sha256 и полный набор случаев`);
+}
+cases = payload.cases;
+if (!cases.length) die(`${casesPath}: нет ни одного случая`);
 
 // --- Проверки --------------------------------------------------------------------------------------
 
