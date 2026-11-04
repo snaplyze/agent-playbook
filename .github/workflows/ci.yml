@@ -91,7 +91,7 @@ jobs:
   deploy:
     if: github.ref == 'refs/heads/main'
     needs: check
-    # Only a push to main reaches this job, so the workflow and the code are trusted.
+    # Only main reaches this job, so the workflow and the code are trusted.
     runs-on: [self-hosted, Linux, X64, fedora, project-agent-playbook]
     timeout-minutes: 15
     permissions:
