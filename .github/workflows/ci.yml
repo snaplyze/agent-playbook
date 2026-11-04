@@ -91,10 +91,16 @@ jobs:
   deploy:
     if: github.ref == 'refs/heads/main'
     needs: check
-    # Only main reaches this job, so the workflow and the code are trusted.
-    runs-on: [self-hosted, Linux, X64, fedora, project-agent-playbook]
+    # Только main доходит сюда, поэтому workflow и код доверенные. Деплой — операция GitHub Pages,
+    # ей не нужны возможности self-hosted; официальный пример использует hosted-раннер.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # Один Pages-деплой за раз: новый не отменяет уже начатую публикацию.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     permissions:
+      contents: read
       pages: write
       id-token: write
     environment:
