@@ -17,12 +17,68 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # The owner's pushes, manual runs and pull requests from this repository run on the
+    # self-hosted runner; forks and bots stay on a GitHub-hosted runner. A pull request runs
+    # the workflow of its own merge commit, so a fork can change `runs-on`: never approve a
+    # fork's run, or it can reach the self-hosted machine.
+    runs-on: >-
+      ${{ fromJSON(
+      (github.actor == github.repository_owner &&
+      (github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.user.login == github.repository_owner &&
+      github.event.pull_request.head.repo.full_name == github.repository)))
+      && '["self-hosted", "Linux", "X64", "fedora", "project-agent-playbook"]'
+      || '"ubuntu-24.04"') }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Tools for self-hosted
+        # The runner has Python, but not Node and Chrome. Both are pinned, checked by SHA-256
+        # and unpacked into this job's temp directory; only the archives stay in the user's
+        # cache outside the workspace. A GitHub-hosted runner already has them.
+        if: runner.environment == 'self-hosted'
+        env:
+          NODE_VERSION: "v24.21.0"
+          NODE_SHA256: "fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6"
+          CHROME_VERSION: "155.0.8059.12"
+          CHROME_SHA256: "aeb9283943ef1f21864ea42ad1201b89f5bcf6a84c3e3d0d641529d251914bed"
+        run: |
+          set -euo pipefail
+          cache="${XDG_CACHE_HOME:-$HOME/.cache}/agent-playbook-ci"
+          mkdir -p "$cache"
+          fetch() {
+            local url=$1 archive=$2 expected=$3 cached fresh work
+            cached="$cache/$archive"
+            if [ ! -f "$cached" ] || [ "$(sha256sum "$cached" | cut -d' ' -f1)" != "$expected" ]; then
+              fresh="$(mktemp "$cache/$archive.XXXXXX")"
+              if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+                --output "$fresh" "$url"; then
+                rm -f "$fresh"
+                return 1
+              fi
+              mv "$fresh" "$cached"
+            fi
+            work="$(mktemp -d "$RUNNER_TEMP/fetch.XXXXXX")"
+            cp "$cached" "$work/$archive"
+            if [ "$(sha256sum "$work/$archive" | cut -d' ' -f1)" != "$expected" ]; then
+              echo "$archive does not match its SHA-256" >&2
+              return 1
+            fi
+            printf '%s\n' "$work/$archive"
+          }
+          node_archive="$(fetch "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-x64.tar.xz" "node-$NODE_VERSION-linux-x64.tar.xz" "$NODE_SHA256")"
+          mkdir -p "$RUNNER_TEMP/node"
+          tar -xJf "$node_archive" -C "$RUNNER_TEMP/node" --strip-components=1
+          echo "$RUNNER_TEMP/node/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/node/bin/node" --version
+          chrome_archive="$(fetch "https://storage.googleapis.com/chrome-for-testing-public/$CHROME_VERSION/linux64/chrome-headless-shell-linux64.zip" "chrome-headless-shell-linux64.zip" "$CHROME_SHA256")"
+          mkdir -p "$RUNNER_TEMP/chrome"
+          unzip -q "$chrome_archive" -d "$RUNNER_TEMP/chrome"
+          echo "CHROME_BIN=$RUNNER_TEMP/chrome/chrome-headless-shell-linux64/chrome-headless-shell" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/chrome/chrome-headless-shell-linux64/chrome-headless-shell" --version
       - run: python3 --version && node --version
       - run: python3 scripts/build.py --check --site "$RUNNER_TEMP/site" --parity-cases "$RUNNER_TEMP/cases.json"
       - run: node scripts/parity.mjs "$RUNNER_TEMP/site/index.html" "$RUNNER_TEMP/cases.json"
@@ -35,7 +91,8 @@ jobs:
   deploy:
     if: github.ref == 'refs/heads/main'
     needs: check
-    runs-on: ubuntu-24.04
+    # Only a push to main reaches this job, so the workflow and the code are trusted.
+    runs-on: [self-hosted, Linux, X64, fedora, project-agent-playbook]
     timeout-minutes: 15
     permissions:
       pages: write
