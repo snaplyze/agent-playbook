@@ -78,6 +78,15 @@ FORBIDDEN_SAMPLES = [
     ("14.10.2026", False), ("курсор", False), ("кодекс", False), ("zed", False), ("organized", False),
     ("Python 3.11+", False),
 ]
+# Ячейка Markdown-таблицы: (вход, ожидаемый текст). Таблицы README не должны ломаться от данных.
+CELL_SAMPLES = [
+    ("обычный", "обычный"),
+    ("a | b", r"a \| b"),
+    ("a\nb", "a b"),
+    ("a\r\nb", "a b"),
+    ("[a]", r"\[a\]"),
+    ("a\\b", r"a\\b"),
+]
 
 
 def fail(message):
@@ -352,8 +361,26 @@ def all_variants(scenarios):
     return [(s, states, assemble(s, states)) for s in scenarios for states in variant_states(s)]
 
 
+def stable_json(value):
+    """Одна каноническая запись JSON для хеша случаев: ключи отсортированы, без пробелов."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def parity_cases(variants):
-    return [{"id": s["id"], "states": states, "expected": text} for s, states, text in variants]
+    cases = [
+        {"id": s["id"], "states": states, "expected": text}
+        for s, states, text in variants
+    ]
+    counts = {}
+    for case in cases:
+        counts[case["id"]] = counts.get(case["id"], 0) + 1
+    return {
+        "version": 1,
+        "count": len(cases),
+        "scenarios": counts,
+        "sha256": hashlib.sha256(stable_json(cases).encode()).hexdigest(),
+        "cases": cases,
+    }
 
 
 # --- Эталон: ожидаемые строки заданы вручную на синтетической модели, а не выводятся из кода сборки -----------
@@ -399,11 +426,22 @@ def option_label(option):
     return option["label"].rstrip("…") + note
 
 
+def md_cell(value):
+    """Одна ячейка Markdown-таблицы: вертикальная черта и переводы строк не ломают строку, скобки — ссылку."""
+    return (value.replace("\\", "\\\\")
+            .replace("|", "\\|")
+            .replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+            .replace("[", "\\[").replace("]", "\\]"))
+
+
 def readme_tables(scenarios, built):
     rows = ["| № | Промпт | Когда | Результат | Чего не делает | Символов |", "|---|---|---|---|---|---:|"]
     for s, text in zip(scenarios, built):
         size = f"{len(text):,}".replace(",", "\u00a0")
-        rows.append(f"| {s['num']} | [{s['name']}](prompts/{s['file']}) | {s['when']} | {s['result']} | {s['never']} | {size} |")
+        rows.append(
+            f"| {s['num']} | [{md_cell(s['name'])}](prompts/{s['file']}) | "
+            f"{md_cell(s['when'])} | {md_cell(s['result'])} | {md_cell(s['never'])} | {size} |"
+        )
     params = ["| Промпт | Параметр | Варианты |", "|---|---|---|"]
     for s in scenarios:
         for param in s["params"]:
@@ -413,8 +451,22 @@ def readme_tables(scenarios, built):
             else:
                 labels = [option_label(o) for o in param["option"]]
                 variants = f"{labels[0]} (по умолчанию); " + "; ".join(labels[1:])
-            params.append(f"| {s['num']} {s['name']} | {param['key']} | {variants} |")
+            params.append(f"| {s['num']} {md_cell(s['name'])} | {md_cell(param['key'])} | {md_cell(variants)} |")
     return {"scenarios": "\n".join(rows), "params": "\n".join(params)}
+
+
+def check_cells(errors):
+    """Самопроверка ячеек README: данные не должны менять число колонок или добавлять строки."""
+    for value, expected in CELL_SAMPLES:
+        actual = md_cell(value)
+        if actual != expected:
+            errors.append(f"CELL: {value!r} -> {actual!r}, ожидалось {expected!r}")
+    probe = {"num": "99", "file": "99-probe.md", "name": "a | b", "when": "c\nd",
+             "result": "e", "never": "f", "params": []}
+    row = readme_tables([probe], ["text"])["scenarios"].splitlines()[-1]
+    cells = re.split(r"(?<!\\)\|", row)[1:-1]
+    if len(cells) != 6 or "\n" in row:
+        errors.append(f"CELL: таблица README сломана данными: {row!r}")
 
 
 def render_readme(text, tables):
@@ -458,21 +510,30 @@ def line_of(text, offset):
 
 
 def strip_code(text):
-    """Текст без кода: блоки и фрагменты заменены пробелами, номера строк и смещения сохранены."""
-    lines, fence = [], None
+    """Текст без кода: fenced-, inline- и indented-блоки заменены пробелами, номера строк и смещения сохранены."""
+    lines, fence, indented, blank = [], None, False, True
     for line in text.split("\n"):
-        if fence is None:
+        if fence is not None:
+            if re.fullmatch(rf" {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*", line):
+                fence = None
+            line = " " * len(line)
+        elif indented:
+            if line.strip() and not re.match(r"^(?: {4}|\t)", line):
+                indented = False
+            else:
+                line = " " * len(line)
+        if fence is None and not indented:
             opening = FENCE.match(line)
             if opening:
                 fence = opening.group(1)
                 line = " " * len(line)
+            elif blank and re.match(r"^(?: {4}|\t)", line):
+                indented = True
+                line = " " * len(line)
             else:
                 line = INLINE_CODE.sub(lambda m: " " * len(m.group(0)), line)
-        else:
-            if re.fullmatch(rf" {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*", line):
-                fence = None
-            line = " " * len(line)
         lines.append(line)
+        blank = not line.strip()
     return "\n".join(lines)
 
 
@@ -586,11 +647,27 @@ def check_numbers(scenarios, rules, errors):
                     errors.append(f"{place(match)}: «{match.group(0)}» — нет {'правила' if is_rule else 'шага'} {number} "
                                   f"в {', '.join(lacking)}")
 
-    verify(lambda m: f"src/rules.md:{line_of(rules, m.start())}", rules, list(steps))
+    verify(lambda m: f"src/rules.md:{line_of(rules, m.start())}", strip_code(rules), list(steps))
     for s in scenarios:
-        verify(lambda m, s=s: f"src/scenarios/{s['file']}:{line_of(s['source'], m.start())}", s["source"], [s["file"]])
+        verify(lambda m, s=s: f"src/scenarios/{s['file']}:{line_of(s['source'], m.start())}", strip_code(s["source"]), [s["file"]])
         for path, text in strings({key: s[key] for key in SCENARIO_KEYS if key in s}):
-            verify(lambda m, path=path, s=s: f"scenarios.toml, {s['file']}, {path}", text, [s["file"]])
+            verify(lambda m, path=path, s=s: f"scenarios.toml, {s['file']}, {path}", strip_code(text), [s["file"]])
+
+
+def check_code(errors):
+    """Самопроверка: примеры в indented- и fenced-коде не считаются ссылками и шагами."""
+    if "missing.md" in strip_code("    [битая](missing.md)"):
+        errors.append("CODE: indented-ссылка не убрана")
+    link_errors = []
+    check_links({"docs/probe.md": "    [битая](missing.md)\n"}, link_errors)
+    if link_errors:
+        errors.append(f"CODE: indented-ссылка дала ошибку: {link_errors[0]}")
+    if "шаг 99" in strip_code("```\nшаг 99\n```"):
+        errors.append("CODE: fenced-шаг не убран")
+    step_errors = []
+    check_numbers([{"file": "probe.md", "source": "```\nшаг 99\n```\n"}], "", step_errors)
+    if step_errors:
+        errors.append(f"CODE: fenced-шаг дал ошибку: {step_errors[0]}")
 
 
 def describe(states):
@@ -633,6 +710,8 @@ def check(scenarios, rules, built, variants, files, readme, current_readme):
             errors.append(f"{s['file']}: незаполненные метки {', '.join(labels)} в {len(unfilled)} из {len(texts)} вариантов, "
                           f"например при состояниях: {describe(states)}")
     check_reference(errors)
+    check_cells(errors)
+    check_code(errors)
     check_links(files, errors)
     check_numbers(scenarios, rules, errors)
     return errors
